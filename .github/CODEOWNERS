@@ -7,10 +7,11 @@
 # Order matters -- later rules take precedence over earlier ones.
 # See GOVERNANCE.md for role definitions and the path to becoming a maintainer.
 
-# Default: the project lead owns everything. Mobile is lead-held
-# under the expertise-based ownership model; area teams can be added
-# here when a mobile maintainer is onboarded.
-* @jlengelbrecht
+# Default: co-owned by the maintainer area teams and the project
+# lead -- any listed owner satisfies the code-owner review, and
+# authors can never approve their own PRs. Safety-critical and
+# release-infrastructure paths below override this (last match wins).
+* @lumose-health/web @lumose-health/ai @jlengelbrecht
 
 # Governance & project policy: project lead.
 /.github/CODEOWNERS @jlengelbrecht
@@ -58,3 +59,12 @@
 /plugins/pump-driver-api/ @jlengelbrecht
 /plugins/shipped/tandem/ @jlengelbrecht
 /plugins/shipped/medtronic/ @jlengelbrecht
+
+# Safety-critical alert and dosing surface in the app module: the
+# plugins above are already lead-only; these app-side files enforce
+# the alert floor and safety limits. Lead review required on every
+# change. Listed last so these override the default rule.
+/app/src/main/java/com/glycemicgpt/mobile/service/AlertFloor.kt @jlengelbrecht
+/app/src/main/java/com/glycemicgpt/mobile/service/AlertFloorStatusProvider.kt @jlengelbrecht
+/app/src/main/java/com/glycemicgpt/mobile/data/local/SafetyLimitsStore.kt @jlengelbrecht
+/docs/contract/safety-constants.md @jlengelbrecht
