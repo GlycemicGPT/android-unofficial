@@ -7,11 +7,14 @@
 # Order matters -- later rules take precedence over earlier ones.
 # See GOVERNANCE.md for role definitions and the path to becoming a maintainer.
 
-# Default: co-owned by the maintainer area teams and the project
-# lead -- any listed owner satisfies the code-owner review, and
-# authors can never approve their own PRs. Safety-critical and
-# release-infrastructure paths below override this (last match wins).
-* @lumose-health/web @lumose-health/ai @jlengelbrecht
+# Default: the mobile app is the web/frontend maintainer's area, so the
+# web team is auto-requested for review alongside the project lead when
+# someone else opens a PR here. This is review-request (tagging) only,
+# not enforcement -- develop requires 0 reviews and no code-owner review,
+# so maintainers self-merge their own PRs; the hard gate is at main
+# (promotion is lead-only, org-enforced). Safety-critical and release
+# paths below re-assert lead ownership (last match wins).
+* @lumose-health/web @jlengelbrecht
 
 # Governance & project policy: project lead.
 /.github/CODEOWNERS @jlengelbrecht
