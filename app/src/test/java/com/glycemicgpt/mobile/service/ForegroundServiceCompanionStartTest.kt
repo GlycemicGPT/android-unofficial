@@ -8,7 +8,9 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import io.mockk.every
 import io.mockk.mockk
+import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -35,6 +37,81 @@ class ForegroundServiceCompanionStartTest {
     @Before
     fun setUp() {
         reporter = FgsTimeoutReporter(ApplicationProvider.getApplicationContext())
+    }
+
+    @After
+    fun tearDown() {
+        // Companion state outlives a Robolectric test's Application; leaving a probe armed would
+        // silently suppress the notification assertions in every test that runs after it.
+        PumpConnectionService.isRunning = { false }
+        AlertStreamService.isRunning = { false }
+    }
+
+    @Test
+    fun `PumpConnectionService rejected redundant start while running warns nobody and records nothing`() {
+        // The service is up and the BLE link is live; the platform refuses the redundant start a
+        // Settings open issues. onStartCommand is never delivered, so no in-service path could
+        // undo a warning posted here (PR #44 review).
+        PumpConnectionService.isRunning = { true }
+        val context = rejectingContext(IllegalStateException("dataSync budget exhausted"))
+
+        val result = PumpConnectionService.start(context)
+
+        assertEquals(
+            ForegroundServiceStartResult.Rejected(
+                FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                "IllegalStateException",
+                ForegroundStartRejectionReason.BUDGET_EXHAUSTED,
+                componentStillRunning = true,
+            ),
+            result,
+        )
+        assertFalse(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION))
+        val appContext: Context = ApplicationProvider.getApplicationContext()
+        assertEquals(
+            0,
+            shadowOf(appContext.getSystemService(NotificationManager::class.java))
+                .allNotifications.size,
+        )
+    }
+
+    @Test
+    fun `AlertStreamService rejected redundant start while connected warns nobody and records nothing`() {
+        AlertStreamService.isRunning = { true }
+        val context = rejectingContext(IllegalStateException("dataSync budget exhausted"))
+
+        val result = AlertStreamService.start(context)
+
+        assertEquals(
+            ForegroundServiceStartResult.Rejected(
+                FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+                "IllegalStateException",
+                ForegroundStartRejectionReason.BUDGET_EXHAUSTED,
+                componentStillRunning = true,
+            ),
+            result,
+        )
+        assertFalse(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM))
+        val appContext: Context = ApplicationProvider.getApplicationContext()
+        assertEquals(
+            0,
+            shadowOf(appContext.getSystemService(NotificationManager::class.java))
+                .allNotifications.size,
+        )
+    }
+
+    @Test
+    fun `a liveness probe that throws is treated as not running`() {
+        // The probe reads a live service's own state; an unreadable signal must fall back to the
+        // conservative answer rather than escape the rejection handler on the boot path.
+        PumpConnectionService.isRunning = { throw IllegalStateException("probe blew up") }
+        val context = rejectingContext(IllegalStateException("dataSync budget exhausted"))
+
+        val result = PumpConnectionService.start(context)
+
+        assertTrue(result is ForegroundServiceStartResult.Rejected)
+        assertFalse((result as ForegroundServiceStartResult.Rejected).componentStillRunning)
+        assertTrue(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION))
     }
 
     @Test

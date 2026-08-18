@@ -62,13 +62,28 @@ class PumpConnectionService : Service() {
         // Shorter wake lock for reconnection: covers max 32s backoff + GATT + JPAKE auth
         private const val RECONNECT_WAKE_LOCK_TIMEOUT_MS = 2L * 60 * 1000 // 2 minutes
 
+        /**
+         * Liveness probe the running instance publishes for [start], mirroring the `started` gate
+         * the in-service survive-branch in [onStartCommand] already uses (PR #44 review). A
+         * rejected *redundant* start -- Settings reopened, a re-login refresh, app `onCreate` --
+         * never reaches `onStartCommand`, so without this the companion would warn that pump
+         * monitoring is off while the BLE link is live and nothing would ever take the warning
+         * back. Holding the instance's state behind a lambda in a companion is a leak only if
+         * [onDestroy] never runs, and the reset there is the same reset the field itself gets;
+         * process death takes both.
+         */
+        @VisibleForTesting
+        @Volatile
+        internal var isRunning: () -> Boolean = { false }
+
         fun start(context: Context): ForegroundServiceStartResult {
             val result = ForegroundServiceStarter.start(
                 context,
                 Intent(context, PumpConnectionService::class.java),
                 FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                isRunning,
             )
-            if (result is ForegroundServiceStartResult.Rejected) {
+            if (result is ForegroundServiceStartResult.Rejected && !result.componentStillRunning) {
                 // The service was never created, so nothing else will tell the user pump
                 // monitoring is off -- most likely on the boot path, with no app UI open to
                 // eventually notice via AlertFloorStatusProvider. GLY-254 owns the full
@@ -221,6 +236,7 @@ class PumpConnectionService : Service() {
         // emission is still in flight.
         lastFloorStatus = alertFloorStatusProvider.current()
         serviceScope.launch { backendConfigured = authTokenStore.isBackendConfigured() }
+        isRunning = { started }
         Timber.d("PumpConnectionService created")
     }
 
@@ -390,6 +406,7 @@ class PumpConnectionService : Service() {
             bluetoothReceiverRegistered = false
         }
         started = false
+        isRunning = { false }
         serviceScope.cancel()
         Timber.d("PumpConnectionService destroyed")
         super.onDestroy()
