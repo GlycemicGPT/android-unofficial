@@ -1,5 +1,6 @@
 package com.glycemicgpt.mobile.service
 
+import android.util.Log
 import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.local.GlucoseRangeStore
 import com.glycemicgpt.mobile.data.local.SafetyLimitsStore
@@ -36,7 +37,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Test
+import timber.log.Timber
 import java.time.Instant
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -147,6 +150,30 @@ class PumpPollingOrchestratorTest {
         PumpPollingOrchestrator.BACKFILL_BATCH_STAGGER_MS * 2 + 100
 
     private fun createOrchestrator() = PumpPollingOrchestrator(pumpDriver, repository, syncEnqueuer, rawHistoryLogDao, wearDataSender, glucoseRangeStore, safetyLimitsStore, historyLogParser, appSettingsStore, alertFloor, loopHealth)
+
+    @After
+    fun tearDown() {
+        // The report-damping tests plant a Timber tree; never leak it into sibling tests.
+        Timber.uprootAll()
+    }
+
+    /**
+     * Captures the priority and formatted text of everything Timber emits. The damping tests are
+     * about which failures reach ERROR — the level Sentry turns into an event — so the level is
+     * the assertion, not an incidental detail.
+     */
+    private class RecordingTree : Timber.Tree() {
+        val lines = mutableListOf<Pair<Int, String>>()
+
+        override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
+            lines += priority to message
+        }
+
+        /** Messages logged at [priority] containing every one of [needles]. */
+        fun at(priority: Int, vararg needles: String): List<String> =
+            lines.filter { (p, message) -> p == priority && needles.all(message::contains) }
+                .map { it.second }
+    }
 
     @Test
     fun `does not poll when disconnected`() = runTest {
@@ -1008,6 +1035,73 @@ class PumpPollingOrchestratorTest {
         advanceTimeBy(60_000)
         coVerify(atLeast = 1) { pumpDriver.getIoB() }
         assertNotNull(loopHealth.snapshot(PollLoop.FAST).lastSuccessAtMs)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a step that fails forever reports once at ERROR, then on the reminder ladder`() = runTest {
+        // ERROR is what Sentry turns into an event, and the loop keeps iterating through a failure
+        // by design — so a stuck step must not bill one event per iteration for as long as the
+        // pump stays connected.
+        val tree = RecordingTree()
+        Timber.plant(tree)
+        every { appSettingsStore.debugFaultPollStep } returns PollStep.IOB.telemetryName
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(SETTLE_TIME_MS)
+        repeat(7) { advanceTimeBy(FAST_CYCLE_MS) }
+
+        assertEquals(8L, loopHealth.snapshot(PollLoop.FAST).failuresSinceLastSuccess)
+        // Failures 1, 2, 4 and 8 of the outage: the opening edge plus doubling reminders.
+        assertEquals(4, tree.at(Log.ERROR, "Poll step failed", "step=iob").size)
+        // Failures 3, 5, 6 and 7 stay on the device.
+        assertEquals(4, tree.at(Log.DEBUG, "Poll step still failing", "step=iob").size)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `recovery still reports, and the next outage opens a fresh ERROR`() = runTest {
+        val tree = RecordingTree()
+        Timber.plant(tree)
+        every { appSettingsStore.debugFaultPollStep } returns PollStep.IOB.telemetryName
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(SETTLE_TIME_MS)
+        repeat(3) { advanceTimeBy(FAST_CYCLE_MS) }
+        assertEquals(3, tree.at(Log.ERROR, "Poll step failed", "step=iob").size)
+
+        // Damping the repeats must not damp the recovery: the WARN that closes the outage is the
+        // other half of the opening event.
+        every { appSettingsStore.debugFaultPollStep } returns ""
+        advanceTimeBy(FAST_CYCLE_MS)
+        assertEquals(1, tree.at(Log.WARN, "Poll loop fast recovered").size)
+
+        // A different step failing after that success is a new outage, not a damped repeat.
+        every { appSettingsStore.debugFaultPollStep } returns PollStep.BASAL.telemetryName
+        advanceTimeBy(FAST_CYCLE_MS)
+        assertEquals(1, tree.at(Log.ERROR, "Poll step failed", "step=basal").size)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a loop that restarts forever reports on the same ladder`() = runTest {
+        val tree = RecordingTree()
+        Timber.plant(tree)
+        every { appSettingsStore.debugFaultPollStep } returns PollLoop.FAST.loopFaultKey
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(10_000)
+
+        // Restarts at 1s, 2s, 4s and 8s of backoff; only the 1st, 2nd and 4th are events.
+        assertEquals(4L, loopHealth.snapshot(PollLoop.FAST).restartCount)
+        assertEquals(3, tree.at(Log.ERROR, "Poll loop fast stopped outside a guarded step").size)
+        assertEquals(1, tree.at(Log.DEBUG, "Poll loop fast still failing outside a guarded step").size)
         orchestrator.stop()
     }
 

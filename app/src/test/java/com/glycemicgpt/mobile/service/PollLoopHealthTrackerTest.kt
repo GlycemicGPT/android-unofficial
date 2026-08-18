@@ -115,6 +115,44 @@ class PollLoopHealthTrackerTest {
     }
 
     @Test
+    fun `failure reports open on the outage edge and then ladder off`() {
+        tracker.markRunning(PollLoop.FAST, nowMs = 1_000L)
+
+        // Failure ordinals 1, 2, 4, 8, 16 are reportable; everything between them is a repeat.
+        val reported = (1..20).filter { ordinal ->
+            val before = tracker.recordStepFailure(
+                PollStep.CGM,
+                RuntimeException("boom"),
+                nowMs = 1_000L + ordinal,
+            )
+            before.opensFailureReport()
+        }
+        assertEquals(listOf(1, 2, 4, 8, 16), reported)
+
+        // A clean iteration ends the outage, so the next failure opens a fresh report — the
+        // ladder must not carry a lifetime count over into the new outage.
+        tracker.recordIterationSuccess(PollLoop.FAST, nowMs = 2_000L)
+        val afterRecovery =
+            tracker.recordStepFailure(PollStep.CGM, RuntimeException("boom"), nowMs = 2_100L)
+        assertTrue("a failure after a success opens a new report", afterRecovery.opensFailureReport())
+    }
+
+    @Test
+    fun `loop restarts share the step failures' report ladder`() {
+        tracker.markRunning(PollLoop.MEDIUM, nowMs = 1_000L)
+
+        val reported = (1..8).filter { ordinal ->
+            tracker.recordLoopRestart(
+                PollLoop.MEDIUM,
+                RuntimeException("escaped"),
+                nowMs = 1_000L + ordinal,
+            ).opensFailureReport()
+        }
+        assertEquals(listOf(1, 2, 4, 8), reported)
+        assertEquals(8L, tracker.snapshot(PollLoop.MEDIUM).restartCount)
+    }
+
+    @Test
     fun `the telemetry summary reports liveness in counters only`() {
         tracker.markRunning(PollLoop.FAST, nowMs = 1_000L)
         assertTrue(tracker.snapshot(PollLoop.FAST).telemetrySummary(2_000L).contains("last_ok=never"))

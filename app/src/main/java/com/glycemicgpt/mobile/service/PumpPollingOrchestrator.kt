@@ -289,20 +289,38 @@ class PumpPollingOrchestrator @Inject constructor(
                 if (loopHealth.snapshot(loop).successCount > successesBefore) {
                     restartAttempt = 0
                 }
-                loopHealth.recordLoopRestart(loop, failure)
+                val before = loopHealth.recordLoopRestart(loop, failure)
                 val backoffMs = restartBackoffMs(restartAttempt)
+                val cause = failure?.javaClass?.simpleName ?: "body returned normally"
+                val liveness = loopHealth.snapshot(loop).telemetrySummary()
                 // Loop, cause and liveness are separate format args: "which loop died", "what
                 // killed it" and "how long it has been without a clean iteration" are three
                 // different questions of the same telemetry event. Exception class only, per the
                 // ERROR/Sentry discipline in [runStep]; the throwable stays at DEBUG.
-                Timber.e(
-                    "Poll loop %s stopped outside a guarded step (%s); restarting in %d ms [%s]",
-                    loop.telemetryName,
-                    failure?.javaClass?.simpleName ?: "body returned normally",
-                    backoffMs,
-                    loopHealth.snapshot(loop).telemetrySummary(),
-                )
-                failure?.let { Timber.d(it, "Poll loop %s restart detail", loop.telemetryName) }
+                //
+                // A body that throws every time restarts forever on the backoff ceiling, so the
+                // report is damped the same way a repeating step failure is: opening edge and
+                // laddered reminders at ERROR, the rest on-device only.
+                if (before.opensFailureReport()) {
+                    Timber.e(
+                        "Poll loop %s stopped outside a guarded step (%s); restarting in %d ms [%s]",
+                        loop.telemetryName,
+                        cause,
+                        backoffMs,
+                        liveness,
+                    )
+                    failure?.let { Timber.d(it, "Poll loop %s restart detail", loop.telemetryName) }
+                } else {
+                    Timber.d(
+                        failure,
+                        "Poll loop %s still failing outside a guarded step (%s); " +
+                            "restarting in %d ms [%s]",
+                        loop.telemetryName,
+                        cause,
+                        backoffMs,
+                        liveness,
+                    )
+                }
                 delay(backoffMs)
                 restartAttempt++
                 nextInitialDelayMs = 0L
@@ -336,7 +354,8 @@ class PumpPollingOrchestrator @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            loopHealth.recordStepFailure(step, e)
+            val before = loopHealth.recordStepFailure(step, e)
+            val liveness = loopHealth.snapshot(step.loop).telemetrySummary()
             // Loop and step are separate format args so a log/Sentry search can isolate either
             // axis: "which loop is broken" and "which step breaks it" are different questions.
             // The liveness summary rides along so the event also answers "and for how long".
@@ -346,19 +365,34 @@ class PumpPollingOrchestrator @Inject constructor(
             // MedtronicReadGateway: the guarded steps parse and persist readings, so an exception
             // from a parser or a Room write can embed a health value in its message, and the
             // beforeSend scrub only catches the unit-suffixed ones.
-            Timber.e(
-                "Poll step failed (loop=%s step=%s cause=%s); continuing loop [%s]",
-                step.loop.telemetryName,
-                step.telemetryName,
-                e.javaClass.simpleName,
-                loopHealth.snapshot(step.loop).telemetrySummary(),
-            )
-            Timber.d(
-                e,
-                "Poll step failure detail (loop=%s step=%s)",
-                step.loop.telemetryName,
-                step.telemetryName,
-            )
+            //
+            // Only the opening edge of an outage and its laddered reminders go to ERROR: the loop
+            // keeps iterating through a failure by design, so an undamped report would ship one
+            // Sentry event per iteration for as long as the fault lasts. See
+            // [PollLoopHealth.opensFailureReport]; the recovery WARN closes the outage either way.
+            if (before.opensFailureReport()) {
+                Timber.e(
+                    "Poll step failed (loop=%s step=%s cause=%s); continuing loop [%s]",
+                    step.loop.telemetryName,
+                    step.telemetryName,
+                    e.javaClass.simpleName,
+                    liveness,
+                )
+                Timber.d(
+                    e,
+                    "Poll step failure detail (loop=%s step=%s)",
+                    step.loop.telemetryName,
+                    step.telemetryName,
+                )
+            } else {
+                Timber.d(
+                    e,
+                    "Poll step still failing (loop=%s step=%s); continuing loop [%s]",
+                    step.loop.telemetryName,
+                    step.telemetryName,
+                    liveness,
+                )
+            }
             false
         }
     }

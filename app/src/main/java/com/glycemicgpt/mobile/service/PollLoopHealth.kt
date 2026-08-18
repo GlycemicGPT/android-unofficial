@@ -91,6 +91,26 @@ data class PollLoopHealth(
      * only means something next to the failure that froze it. Counters and durations only: no
      * reading values, nothing that could carry PHI through the log pipeline.
      */
+    /**
+     * Whether the failure recorded immediately AFTER this snapshot is worth an ERROR — which
+     * `SentryInitializer` forwards as a Sentry event — or is a repeat that belongs at DEBUG.
+     *
+     * A loop now keeps iterating through a failing step by design, so a durable fault (a SQLCipher
+     * write that never succeeds, a parser that rejects every record) would otherwise emit one event
+     * per iteration: four a minute on the fast loop, for as long as the pump stays connected. That
+     * exhausts the event quota, costs battery and network, and buries unrelated errors.
+     *
+     * So: report the opening edge of an outage, then exponentially rarer reminders — failures 1, 2,
+     * 4, 8, 16... of the current outage. A day-long fast-loop outage costs ~13 events instead of
+     * ~5,700; the reminders keep a long outage from vanishing from telemetry entirely; and the
+     * spacing needs no per-loop tuning, because it follows each loop's own cadence. Everything in
+     * between is logged on-device at DEBUG, and the recovery WARN still closes the outage.
+     */
+    fun opensFailureReport(): Boolean {
+        val ordinal = failuresSinceLastSuccess + 1
+        return (ordinal and (ordinal - 1)) == 0L
+    }
+
     fun telemetrySummary(nowMs: Long = System.currentTimeMillis()): String = buildString {
         append("last_ok=")
         append(lastSuccessAtMs?.let { "${nowMs - it}ms_ago" } ?: "never")
@@ -173,40 +193,47 @@ class PollLoopHealthTracker @Inject constructor() {
         )
     }
 
-    /** A guarded step threw. The loop continues; the heartbeat deliberately does not advance for
-     *  this iteration, so a step that fails forever surfaces as a frozen heartbeat. */
+    /**
+     * A guarded step threw. The loop continues; the heartbeat deliberately does not advance for
+     * this iteration, so a step that fails forever surfaces as a frozen heartbeat.
+     *
+     * Returns the health as it was JUST BEFORE this failure, so the caller can tell the opening
+     * edge of an outage from a repeat ([PollLoopHealth.opensFailureReport]) without a second read
+     * racing the next iteration.
+     */
     fun recordStepFailure(
         step: PollStep,
         error: Throwable,
         nowMs: Long = System.currentTimeMillis(),
-    ) {
-        update(step.loop) {
-            it.copy(
-                lastFailureAtMs = nowMs,
-                lastFailureStep = step,
-                lastFailureMessage = error.toString(),
-                failureCount = it.failureCount + 1,
-                failuresSinceLastSuccess = it.failuresSinceLastSuccess + 1,
-            )
-        }
+    ): PollLoopHealth = update(step.loop) {
+        it.copy(
+            lastFailureAtMs = nowMs,
+            lastFailureStep = step,
+            lastFailureMessage = error.toString(),
+            failureCount = it.failureCount + 1,
+            failuresSinceLastSuccess = it.failuresSinceLastSuccess + 1,
+        )
     }
 
-    /** The loop body threw outside any guarded step and the supervisor is relaunching it. */
+    /**
+     * The loop body threw outside any guarded step and the supervisor is relaunching it.
+     *
+     * Returns the pre-failure health, on the same terms as [recordStepFailure]: a body that throws
+     * forever restarts on backoff indefinitely, and its report needs the same damping.
+     */
     fun recordLoopRestart(
         loop: PollLoop,
         error: Throwable?,
         nowMs: Long = System.currentTimeMillis(),
-    ) {
-        update(loop) {
-            it.copy(
-                lastFailureAtMs = nowMs,
-                lastFailureStep = null,
-                lastFailureMessage = error?.toString() ?: "loop body returned unexpectedly",
-                failureCount = it.failureCount + 1,
-                failuresSinceLastSuccess = it.failuresSinceLastSuccess + 1,
-                restartCount = it.restartCount + 1,
-            )
-        }
+    ): PollLoopHealth = update(loop) {
+        it.copy(
+            lastFailureAtMs = nowMs,
+            lastFailureStep = null,
+            lastFailureMessage = error?.toString() ?: "loop body returned unexpectedly",
+            failureCount = it.failureCount + 1,
+            failuresSinceLastSuccess = it.failuresSinceLastSuccess + 1,
+            restartCount = it.restartCount + 1,
+        )
     }
 
     /** Applies [transform] to one loop's entry and returns the value it replaced. */
