@@ -51,12 +51,23 @@ class AlertStreamService : Service() {
         const val NOTIFICATION_ID = 2
         private const val MAX_BACKOFF_MS = 60_000L
         private const val STABLE_CONNECTION_MS = 10_000L // Must be open 10s before resetting backoff
-        fun start(context: Context) {
-            ForegroundServiceStarter.start(
+        fun start(context: Context): ForegroundServiceStartResult {
+            val result = ForegroundServiceStarter.start(
                 context,
                 Intent(context, AlertStreamService::class.java),
                 FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
             )
+            if (result is ForegroundServiceStartResult.Rejected) {
+                // The service was never created, so nothing else will tell the user alert
+                // delivery is off -- most likely on the boot path, with no app UI open to
+                // eventually notice. GLY-254 owns the full monitoring-health surface and will
+                // supersede this notification.
+                MonitoringDegradedNotifier.notify(
+                    context.applicationContext ?: context,
+                    FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+                )
+            }
+            return result
         }
 
         fun stop(context: Context) {
@@ -80,8 +91,11 @@ class AlertStreamService : Service() {
     // OkHttp-thread callbacks; without @Volatile a stale null read could leak a live connection
     // or open a duplicate one. Mutation is additionally confined to the @Synchronized
     // connectToStream/shutDownStream pair so only one connection transition runs at a time.
+    /** Test seam: lets a rejected-redundant-repromote test set up an already-connected stream
+     *  without driving a real SSE connection. */
+    @VisibleForTesting
     @Volatile
-    private var eventSource: EventSource? = null
+    internal var eventSource: EventSource? = null
 
     /** Set once in [shutDownStream]; blocks any late reconnect from resurrecting the stream. */
     @Volatile
@@ -152,24 +166,39 @@ class AlertStreamService : Service() {
             FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
             fgsTimeoutReporter,
         )
-        if (result is ForegroundServiceStartResult.Rejected) {
-            // Android 15 refuses a dataSync foreground start once the 24 h budget is spent
-            // (ForegroundServiceStartNotAllowedException, an IllegalStateException). Letting it
-            // escape kills the whole process -- taking PumpConnectionService and the pump link
-            // with it, which is the exact failure this service's onTimeout exists to prevent.
-            // Stop instead; the state holder already reports the honest degraded state, so the
-            // on-device alert floor arms rather than the user silently losing coverage.
-            alertStreamStateHolder.onStreamStopped()
-            stopSelf(startId)
-            return START_NOT_STICKY
-        }
         // A redundant start() (Settings opening, a re-login refresh) must not tear down a healthy
         // stream: the silent cancel-and-reconnect was invisible before the alerting-degraded
         // banner existed, but now it would flash "server alerts paused" for the seconds the
         // reconnect takes. A broken stream is never CONNECTED, so real recovery still proceeds.
-        if (eventSource == null ||
-            alertStreamStateHolder.state.value != AlertStreamState.CONNECTED
-        ) {
+        // Computed before the Rejected branch below so a rejected *redundant* re-promote can
+        // consult it too (GLY-246 review F6): a healthy running stream must survive one.
+        val alreadyConnected = eventSource != null &&
+            alertStreamStateHolder.state.value == AlertStreamState.CONNECTED
+
+        if (result is ForegroundServiceStartResult.Rejected) {
+            if (alreadyConnected) {
+                Timber.w(
+                    "AlertStreamService redundant re-promote rejected (%s); stream already connected, continuing",
+                    result.exceptionType,
+                )
+            } else {
+                // Android 15 refuses a dataSync foreground start once the 24 h budget is spent
+                // (ForegroundServiceStartNotAllowedException, an IllegalStateException). Letting
+                // it escape kills the whole process -- taking PumpConnectionService and the pump
+                // link with it, which is the exact failure this service's onTimeout exists to
+                // prevent. Stop instead; the state holder already reports the honest degraded
+                // state, so the on-device alert floor arms rather than the user silently losing
+                // coverage.
+                alertStreamStateHolder.onStreamStopped()
+                // GLY-254 owns the full monitoring-health surface and will supersede this
+                // notification.
+                MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+        }
+
+        if (!alreadyConnected) {
             connectToStream()
             Timber.d("AlertStreamService started")
         } else {

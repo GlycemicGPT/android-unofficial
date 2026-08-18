@@ -56,7 +56,8 @@ class WearChatRelayService : WearableListenerService() {
     internal val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** Tracks active foreground work items. Only stop foreground when count hits 0. */
-    private val activeWorkCount = AtomicInteger(0)
+    @VisibleForTesting
+    internal val activeWorkCount = AtomicInteger(0)
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
         when (messageEvent.path) {
@@ -186,7 +187,8 @@ class WearChatRelayService : WearableListenerService() {
      * Uses an atomic counter so concurrent work items (e.g., chat + alert dismiss
      * arriving simultaneously) keep the foreground state until ALL complete.
      */
-    private fun startWork() {
+    @VisibleForTesting
+    internal fun startWork() {
         if (activeWorkCount.getAndIncrement() == 0) {
             ensureNotificationChannel()
             val notification = buildNotification()

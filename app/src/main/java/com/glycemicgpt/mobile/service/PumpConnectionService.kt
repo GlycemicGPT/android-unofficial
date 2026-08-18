@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.IBinder
 import android.os.PowerManager
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.glycemicgpt.mobile.R
@@ -61,12 +62,23 @@ class PumpConnectionService : Service() {
         // Shorter wake lock for reconnection: covers max 32s backoff + GATT + JPAKE auth
         private const val RECONNECT_WAKE_LOCK_TIMEOUT_MS = 2L * 60 * 1000 // 2 minutes
 
-        fun start(context: Context) {
-            ForegroundServiceStarter.start(
+        fun start(context: Context): ForegroundServiceStartResult {
+            val result = ForegroundServiceStarter.start(
                 context,
                 Intent(context, PumpConnectionService::class.java),
                 FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
             )
+            if (result is ForegroundServiceStartResult.Rejected) {
+                // The service was never created, so nothing else will tell the user pump
+                // monitoring is off -- most likely on the boot path, with no app UI open to
+                // eventually notice via AlertFloorStatusProvider. GLY-254 owns the full
+                // monitoring-health surface and will supersede this notification.
+                MonitoringDegradedNotifier.notify(
+                    context.applicationContext ?: context,
+                    FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                )
+            }
+            return result
         }
 
         fun stop(context: Context) {
@@ -120,8 +132,12 @@ class PumpConnectionService : Service() {
     private var wakeLockRenewalJob: Job? = null
     private var floorStatusWatcherJob: Job? = null
     private var wearStatusForwarderJob: Job? = null
+
+    /** Test seam: lets a rejected-redundant-repromote test set up an already-running service
+     *  without driving the full startup path. */
+    @VisibleForTesting
     @Volatile
-    private var started = false
+    internal var started = false
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -216,15 +232,30 @@ class PumpConnectionService : Service() {
             fgsTimeoutReporter,
         )
         if (result is ForegroundServiceStartResult.Rejected) {
-            // The BLE link and polling only matter behind a live foreground promotion -- without
-            // one the system can kill this process at any time. Stop cleanly instead of running
-            // unprotected; the rejection is already durably recorded for GLY-254 to resume from.
-            Timber.w(
-                "PumpConnectionService foreground start rejected (%s); stopping",
-                result.exceptionType,
-            )
-            stopSelf(startId)
-            return START_NOT_STICKY
+            if (started) {
+                // A redundant re-promote (e.g. Settings reopened while already connected) was
+                // rejected -- the BLE link and polling are already live. Tearing this down would
+                // destroy a working connection over a rejection that only hit the *notification*
+                // re-promotion, not the work already underway (GLY-246 review F6).
+                Timber.w(
+                    "PumpConnectionService redundant re-promote rejected (%s); already running, continuing",
+                    result.exceptionType,
+                )
+            } else {
+                // The BLE link and polling only matter behind a live foreground promotion --
+                // without one the system can kill this process at any time. Stop cleanly instead
+                // of running unprotected; the rejection is already durably recorded for GLY-254
+                // to resume from.
+                Timber.w(
+                    "PumpConnectionService foreground start rejected (%s); stopping",
+                    result.exceptionType,
+                )
+                // GLY-254 owns the full monitoring-health surface and will supersede this
+                // notification.
+                MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
         }
 
         // Guard: only start orchestrators and watchers once per service lifecycle.
