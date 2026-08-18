@@ -19,6 +19,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -36,6 +37,10 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.glycemicgpt.mobile.data.local.BleDebugStore
 import com.glycemicgpt.mobile.domain.model.ConnectionState
+import com.glycemicgpt.mobile.service.PollLoop
+import com.glycemicgpt.mobile.service.PollLoopHealth
+import com.glycemicgpt.mobile.service.PollStep
+import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
@@ -48,6 +53,8 @@ fun BleDebugScreen(
 ) {
     val entries by viewModel.entries.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
+    val loopHealth by viewModel.pollLoopHealth.collectAsState()
+    val armedFault by viewModel.armedPollFault.collectAsState()
     val listState = rememberLazyListState()
 
     Column(
@@ -119,6 +126,16 @@ fun BleDebugScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        // Poll-loop liveness + fault injection (GLY-249): watch a chosen step (or a whole loop
+        // body) throw on a real device and confirm the loop keeps its heartbeat / gets restarted.
+        PollLoopHealthPanel(
+            health = loopHealth,
+            armedFault = armedFault,
+            onArmFault = viewModel::setArmedPollFault,
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
         Text(
             text = "${entries.size} entries",
             style = MaterialTheme.typography.bodySmall,
@@ -139,6 +156,116 @@ fun BleDebugScreen(
             }
         }
     }
+}
+
+/**
+ * Liveness readout for the three poll loops plus the fault-injection selector.
+ *
+ * The heartbeat line is the point: a loop whose steps keep throwing shows a frozen "last ok",
+ * a restarted loop shows a non-zero restart count, and a stopped loop says so instead of looking
+ * dead. This is the same state the polling watchdog judges liveness by.
+ */
+@Composable
+private fun PollLoopHealthPanel(
+    health: Map<PollLoop, PollLoopHealth>,
+    armedFault: String,
+    onArmFault: (String) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().testTag("poll_loop_health_panel"),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        ),
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Text(text = "Poll loops", style = MaterialTheme.typography.labelLarge)
+            PollLoop.entries.forEach { loop ->
+                val loopHealth = health[loop] ?: PollLoopHealth(loop)
+                Text(
+                    text = buildString {
+                        append(loop.telemetryName)
+                        append(if (loopHealth.running) " · running" else " · stopped")
+                        append(" · last ok ")
+                        append(
+                            loopHealth.lastSuccessAtMs
+                                ?.let { timeFormatter.format(Instant.ofEpochMilli(it)) }
+                                ?: "never",
+                        )
+                        append(" · ok=${loopHealth.successCount}")
+                        append(" fail=${loopHealth.failureCount}")
+                        // Failures since the heartbeat last moved: on a broken loop this is the
+                        // length of the CURRENT outage, which the lifetime count alone hides.
+                        if (loopHealth.failuresSinceLastSuccess > 0) {
+                            append("(${loopHealth.failuresSinceLastSuccess} since ok)")
+                        }
+                        append(" restarts=${loopHealth.restartCount}")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    modifier = Modifier.testTag("poll_loop_health_${loop.telemetryName}"),
+                )
+                loopHealth.lastFailureMessage?.let { message ->
+                    Text(
+                        text = "  last failure" +
+                            (loopHealth.lastFailureStep?.let { " @${it.telemetryName}" } ?: "") +
+                            ": $message",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp))
+
+            Text(
+                text = "Inject fault (armed: ${armedFault.ifEmpty { "none" }})",
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Row(
+                modifier = Modifier
+                    .horizontalScroll(rememberScrollState())
+                    .testTag("poll_fault_selector"),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                PollFaultChip("none", "", armedFault, onArmFault)
+                PollLoop.entries.forEach { loop ->
+                    PollFaultChip(
+                        label = "${loop.telemetryName} loop",
+                        key = loop.loopFaultKey,
+                        armedFault = armedFault,
+                        onArmFault = onArmFault,
+                    )
+                }
+                PollStep.entries.forEach { step ->
+                    PollFaultChip(
+                        label = step.telemetryName,
+                        key = step.telemetryName,
+                        armedFault = armedFault,
+                        onArmFault = onArmFault,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PollFaultChip(
+    label: String,
+    key: String,
+    armedFault: String,
+    onArmFault: (String) -> Unit,
+) {
+    FilterChip(
+        selected = armedFault == key,
+        onClick = { onArmFault(key) },
+        label = { Text(text = label, fontSize = 11.sp) },
+        modifier = Modifier.testTag("poll_fault_chip_${key.ifEmpty { "none" }}"),
+    )
 }
 
 @Composable

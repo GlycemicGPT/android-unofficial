@@ -339,6 +339,26 @@ class AppSettingsStore @Inject constructor(
             prefs.edit().putBoolean(KEY_DEBUG_FAST_STALENESS, value).apply()
         }
 
+    /**
+     * Debug-only fault injection (GLY-249): the telemetry key of the poll step that should throw on
+     * every iteration, or the empty string for "no fault armed". Step keys come from
+     * [com.glycemicgpt.mobile.service.PollStep.telemetryName]; the
+     * [com.glycemicgpt.mobile.service.PollLoop.loopFaultKey] values instead throw from the loop
+     * body outside the per-step guard, so the supervising restart can be watched on a real device.
+     * Debug-only, same hard gate as [simulateBackendUnreachable] — in release the getter is always
+     * empty, so no step name can ever match and no fault can fire.
+     */
+    var debugFaultPollStep: String
+        get() = if (BuildConfig.DEBUG) {
+            prefs.getString(KEY_DEBUG_FAULT_POLL_STEP, "") ?: ""
+        } else {
+            ""
+        }
+        set(value) {
+            if (!BuildConfig.DEBUG) return
+            prefs.edit().putString(KEY_DEBUG_FAULT_POLL_STEP, value).apply()
+        }
+
     /** Emits [simulateBackendUnreachable] and re-emits on change, so `AlertStreamService` can
      *  force-drop its SSE stream the moment the fault toggle flips on (the injected transport
      *  fault only affects NEW requests; a healthy long-lived stream would otherwise stay
@@ -423,5 +443,6 @@ class AppSettingsStore @Inject constructor(
         private const val KEY_ALLOW_INSECURE_LAN_HTTP = "allow_insecure_lan_http"
         private const val KEY_SIMULATE_BACKEND_UNREACHABLE = "debug_simulate_backend_unreachable"
         private const val KEY_DEBUG_FAST_STALENESS = "debug_fast_staleness"
+        private const val KEY_DEBUG_FAULT_POLL_STEP = "debug_fault_poll_step"
     }
 }

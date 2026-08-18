@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.glycemicgpt.mobile.BuildConfig
+import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.local.BleDebugStore
 import com.glycemicgpt.mobile.data.repository.PumpDataRepository
 import com.glycemicgpt.mobile.data.repository.SyncQueueEnqueuer
@@ -13,13 +14,18 @@ import com.glycemicgpt.mobile.domain.model.CgmTrend
 import com.glycemicgpt.mobile.domain.model.ConnectionState
 import com.glycemicgpt.mobile.domain.model.PumpActivityMode
 import com.glycemicgpt.mobile.domain.pump.PumpConnectionManager
+import com.glycemicgpt.mobile.service.PollLoop
+import com.glycemicgpt.mobile.service.PollLoopHealth
+import com.glycemicgpt.mobile.service.PollLoopHealthTracker
 import com.glycemicgpt.mobile.service.PumpConnectionService
 import com.glycemicgpt.mobile.service.PumpPollingOrchestrator
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import timber.log.Timber
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.time.Instant
 import javax.inject.Inject
@@ -31,14 +37,39 @@ class BleDebugViewModel @Inject constructor(
     private val pumpDataRepository: PumpDataRepository,
     private val pollingOrchestrator: PumpPollingOrchestrator,
     private val syncEnqueuer: SyncQueueEnqueuer,
+    private val appSettingsStore: AppSettingsStore,
+    pollLoopHealthTracker: PollLoopHealthTracker,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
     val entries: StateFlow<List<BleDebugStore.Entry>> = debugStore.entries
     val connectionState: StateFlow<ConnectionState> = connectionManager.connectionState
 
+    /** Per-loop liveness (GLY-249): last successful iteration, last failure and its step, and how
+     *  many times the supervisor has had to relaunch the loop. */
+    val pollLoopHealth: StateFlow<Map<PollLoop, PollLoopHealth>> = pollLoopHealthTracker.health
+
+    private val _armedPollFault = MutableStateFlow(appSettingsStore.debugFaultPollStep)
+
+    /** Currently armed poll fault key, or empty for none. This ViewModel is the only writer, so
+     *  the mirror cannot drift from the store. */
+    val armedPollFault: StateFlow<String> = _armedPollFault.asStateFlow()
+
     fun clearEntries() {
         debugStore.clear()
+    }
+
+    /**
+     * Debug-only: arm (or with an empty [key], disarm) a poll fault so the recovery paths can be
+     * watched on a real device — a step key makes that step throw every iteration (the loop must
+     * keep running), a loop key makes the loop body throw outside the step guards (the supervisor
+     * must back off and relaunch it). Hard-gated to debug builds like the sibling fault toggles;
+     * the store gates itself too.
+     */
+    fun setArmedPollFault(key: String) {
+        if (!BuildConfig.DEBUG) return
+        appSettingsStore.debugFaultPollStep = key
+        _armedPollFault.value = appSettingsStore.debugFaultPollStep
     }
 
     /**

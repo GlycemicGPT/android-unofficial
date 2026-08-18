@@ -85,6 +85,7 @@ class AlertRelayFloorDivergenceTest {
             mockk<HistoryLogParser>(relaxed = true),
             appSettingsStore,
             floor,
+            PollLoopHealthTracker(),
         )
     }
 
