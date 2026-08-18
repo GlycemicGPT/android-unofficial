@@ -140,29 +140,44 @@ class WatchFaceReceiveService : WearableListenerService() {
         }
     }
 
+    /**
+     * The narrower [ForegroundServiceStarter] catch only classifies the platform's own rejection
+     * types; this outer catch is the backstop the pre-GLY-246 code had (channel creation and
+     * notification build ran inside the same `catch (e: Exception)` as the promotion call), kept
+     * so an unexpected throw here still can't escape a `WearableListenerService` callback with no
+     * enclosing try/catch of its own.
+     */
     private fun tryPromoteToForeground() {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (nm.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(
-                    NOTIFICATION_CHANNEL_ID,
-                    "Watch Face Install",
-                    NotificationManager.IMPORTANCE_LOW,
-                ),
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            if (nm.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
+                nm.createNotificationChannel(
+                    NotificationChannel(
+                        NOTIFICATION_CHANNEL_ID,
+                        "Watch Face Install",
+                        NotificationManager.IMPORTANCE_LOW,
+                    ),
+                )
+            }
+            val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+                .setContentTitle("Installing watch face")
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setOngoing(true)
+                .build()
+            ForegroundServiceStarter.promote(
+                this,
+                FOREGROUND_ID,
+                notification,
+                FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Unexpected failure promoting watch face receive to foreground")
+            FgsTimeoutReporter.recordForegroundStartRejected(
+                FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
+                e,
             )
         }
-        val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("Installing watch face")
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setOngoing(true)
-            .build()
-        ForegroundServiceStarter.promote(
-            this,
-            FOREGROUND_ID,
-            notification,
-            FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-        )
     }
 
     private suspend fun receiveAndInstallWatchFace(channel: ChannelClient.Channel) {
