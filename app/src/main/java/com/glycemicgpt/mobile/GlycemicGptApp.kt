@@ -7,7 +7,6 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.glycemicgpt.mobile.data.auth.AuthManager
-import com.glycemicgpt.mobile.data.local.PumpCredentialStore
 import com.glycemicgpt.mobile.data.network.NetworkMonitor
 import com.glycemicgpt.mobile.data.network.NetworkStatus
 import com.glycemicgpt.mobile.data.repository.AlertRepository
@@ -15,7 +14,8 @@ import com.glycemicgpt.mobile.logging.ReleaseTree
 import com.glycemicgpt.mobile.logging.SentryInitializer
 import com.glycemicgpt.mobile.plugin.PluginRegistry
 import com.glycemicgpt.mobile.service.DataRetentionWorker
-import com.glycemicgpt.mobile.service.PumpConnectionService
+import com.glycemicgpt.mobile.service.MonitoringForegroundObserver
+import com.glycemicgpt.mobile.service.MonitoringReconciler
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 import timber.log.Timber
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
+import javax.inject.Provider
 
 @HiltAndroidApp
 class GlycemicGptApp : Application(), Configuration.Provider {
@@ -32,8 +33,14 @@ class GlycemicGptApp : Application(), Configuration.Provider {
     @Inject
     lateinit var workerFactory: HiltWorkerFactory
 
+    /**
+     * A [Provider], not the singleton: nothing in application init needs a reconciler, and
+     * resolving one builds the keystore-backed credential store it reads. A worker run, an
+     * inbound wear message or a notification action never foregrounds an Activity, so those
+     * process starts never resolve it at all.
+     */
     @Inject
-    lateinit var pumpCredentialStore: PumpCredentialStore
+    lateinit var monitoringReconciler: Provider<MonitoringReconciler>
 
     @Inject
     lateinit var authManager: AuthManager
@@ -99,11 +106,14 @@ class GlycemicGptApp : Application(), Configuration.Provider {
         // Validate auth tokens on startup and schedule proactive refresh
         authManager.validateOnStartup(appScope)
 
-        // Start pump connection service on cold start if already paired.
-        // This ensures polling and auto-reconnect resume after app restart.
-        if (pumpCredentialStore.isPaired()) {
-            PumpConnectionService.start(this)
-        }
+        // Observe, never start. This runs on every process creation, including the ones nobody
+        // asked for -- a periodic worker, an inbound wear message, a notification action -- where
+        // the app is in the background and the platform rejects a foreground-service start with a
+        // ForegroundServiceStartNotAllowedException, which becomes an "Unable to create
+        // application" crash. Registering here and reconciling once an Activity is actually
+        // visible resumes polling and auto-reconnect on app open with no start attempted from a
+        // context that cannot legally make one (see MonitoringReconciler).
+        registerActivityLifecycleCallbacks(MonitoringForegroundObserver(monitoringReconciler))
     }
 
     private fun scheduleDataRetention() {

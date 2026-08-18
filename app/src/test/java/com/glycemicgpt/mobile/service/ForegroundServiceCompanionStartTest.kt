@@ -21,7 +21,7 @@ import org.robolectric.annotation.Config
 
 /**
  * [PumpConnectionService.start] and [AlertStreamService.start] are the two companion-function
- * call sites GLY-246 covers (every other Context-level call site -- `GlycemicGptApp.onCreate`,
+ * call sites GLY-246 covers (every other Context-level call site -- `MonitoringReconciler`,
  * `BootCompletedReceiver`, `AuthRepository`, the pairing/settings/debug ViewModels -- calls one
  * of these two, so proving they never throw and tag their own component correctly covers all of
  * them transitively; [ForegroundServiceStarterCoverageTest] is what pins that no call site

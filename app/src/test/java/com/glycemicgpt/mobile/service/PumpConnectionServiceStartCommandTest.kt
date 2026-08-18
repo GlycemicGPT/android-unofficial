@@ -6,11 +6,13 @@ import android.app.Application
 import android.app.Service
 import android.content.Intent
 import androidx.test.core.app.ApplicationProvider
+import com.glycemicgpt.mobile.domain.alerting.AlertFloorStatus
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
+import kotlinx.coroutines.flow.emptyFlow
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -51,6 +53,9 @@ class PumpConnectionServiceStartCommandTest {
     @After
     fun tearDown() {
         unmockkObject(ForegroundServiceStarter)
+        // onCreate arms the companion liveness probe against this instance; leaving it armed
+        // would make a later test's reconcile see a service that no longer exists.
+        PumpConnectionService.isRunning = { false }
     }
 
     @Test
@@ -100,6 +105,57 @@ class PumpConnectionServiceStartCommandTest {
             service.fgsTimeoutReporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION),
         )
     }
+
+    @Test
+    fun `a sticky restart resumes monitoring from the null intent the system redelivers`() {
+        // START_STICKY recreation: the platform rebuilds the service (and the process with it) and
+        // calls onStartCommand with a null intent. This is the third way monitoring comes back --
+        // alongside app open and boot -- and the one that no longer has Application.onCreate
+        // firing a second, illegal start on top of it.
+        val service = fullyWiredService()
+
+        val result = service.onStartCommand(null, Service.START_FLAG_RETRY, START_ID)
+
+        assertEquals(Service.START_STICKY, result)
+        assertTrue("the rebuilt service must come back watching", service.started)
+        verify(exactly = 1) { service.pollingOrchestrator.start(any()) }
+        verify(exactly = 1) { service.connectionManager.autoReconnectIfPaired() }
+    }
+
+    @Test
+    fun `a redelivered start on a live service does not restart the orchestrators`() {
+        // Whatever else reaches a running service -- a sticky redelivery, a redundant start from
+        // the reconciler or Settings -- must be idempotent: a second orchestrator start would
+        // double every poll loop.
+        val service = fullyWiredService()
+        service.onStartCommand(null, Service.START_FLAG_RETRY, START_ID)
+
+        service.onStartCommand(Intent(), 0, START_ID + 1)
+
+        verify(exactly = 1) { service.pollingOrchestrator.start(any()) }
+        verify(exactly = 1) { service.connectionManager.autoReconnectIfPaired() }
+    }
+
+    /**
+     * A service instance with every injected collaborator relaxed-mocked, so the full startup
+     * block in `onStartCommand` can run. `onCreate` is deliberately not driven -- Hilt's generated
+     * one demands an `@HiltAndroidApp` Application this Robolectric config does not have -- and
+     * nothing in the startup block needs it: `lastFloorStatus` already defaults to the value
+     * `onCreate` would seed, and posting to a channel that was never created is a no-op here.
+     */
+    private fun fullyWiredService(): PumpConnectionService =
+        Robolectric.buildService(PumpConnectionService::class.java).get().apply {
+            fgsTimeoutReporter = FgsTimeoutReporter(ApplicationProvider.getApplicationContext())
+            pollingOrchestrator = mockk(relaxed = true)
+            backendSyncManager = mockk(relaxed = true)
+            connectionManager = mockk(relaxed = true)
+            alertFloorStatusProvider = mockk(relaxed = true) {
+                every { current() } returns AlertFloorStatus.ServerActive
+                every { observe() } returns emptyFlow()
+            }
+            wearMonitoringStatusForwarder = mockk(relaxed = true)
+            authTokenStore = mockk(relaxed = true)
+        }
 
     private companion object {
         const val START_ID = 11

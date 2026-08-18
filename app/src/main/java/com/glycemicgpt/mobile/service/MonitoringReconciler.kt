@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Josh Engelbrecht
+package com.glycemicgpt.mobile.service
+
+import android.app.ActivityManager
+import android.content.Context
+import android.os.PowerManager
+import com.glycemicgpt.mobile.data.local.PumpCredentialStore
+import dagger.hilt.android.qualifiers.ApplicationContext
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Decides whether pump monitoring *should* be running and, when it should, starts it -- but only
+ * from a context where a foreground-service start is legal.
+ *
+ * This replaces the unconditional `PumpConnectionService.start(this)` that used to sit at the end
+ * of `GlycemicGptApp.onCreate`. `Application.onCreate` runs on every process creation, including
+ * the many the user never triggered: a periodic `DataRetentionWorker`/`NightscoutSyncWorker` run,
+ * an inbound wear message waking `WearChatRelayService`, `AlertActionReceiver` handling a
+ * notification action, any ContentProvider touch. In all of those the app is in the background,
+ * where Android 12+ refuses a foreground-service start outright -- field DropBox evidence on an
+ * Android 16 device shows `ForegroundServiceStartNotAllowedException` (`mAllowStartForeground`
+ * false) thrown out of `GlycemicGptApp.onCreate` at 198 ms of process age, which the platform
+ * turns into "Unable to create application" -- the app's top background crasher. Routing the call
+ * through [ForegroundServiceStarter] stopped the crash; not making the call at all is the fix.
+ *
+ * So application init now only registers and observes ([MonitoringForegroundObserver]), and the
+ * decision to start moves here, behind an explicit trigger:
+ *
+ * - [MonitoringReconcileTrigger.APP_FOREGROUNDED] -- an Activity is visible, which is the
+ *   textbook legal context.
+ * - [MonitoringReconcileTrigger.BOOT_COMPLETED] -- still exempt for the `connectedDevice` type
+ *   [PumpConnectionService] declares (the Android 15 per-type restrictions on `BOOT_COMPLETED`
+ *   starts do not cover it).
+ * - [MonitoringReconcileTrigger.BACKGROUND] -- no such guarantee, so eligibility is probed first
+ *   (process importance, or a battery-optimization exemption) and an ineligible reconcile defers
+ *   instead of attempting a start the platform would refuse.
+ *
+ * Deferring is safe because "should monitoring run" is derived from durable state
+ * ([PumpCredentialStore.isPaired]) on every call, not latched anywhere: whatever a deferred
+ * reconcile did not do, the next legal trigger does. GLY-254 extends this seam with the periodic
+ * WorkManager + AlarmManager backstop that turns "the next legal trigger" from "whenever the user
+ * opens the app" into a bounded interval; deliberately not built here.
+ *
+ * Nothing in here may throw. Its callers are an `ActivityLifecycleCallbacks` and a
+ * `BroadcastReceiver`, where an escaping exception is an app crash -- which is the failure mode
+ * this whole class exists to remove.
+ */
+@Singleton
+class MonitoringReconciler @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val pumpCredentialStore: PumpCredentialStore,
+    private val backgroundStartEligibility: BackgroundStartEligibility,
+) {
+
+    /**
+     * Brings pump monitoring in line with what [trigger]'s context allows, and reports why it
+     * decided as it did. Safe to call redundantly -- an already-running service short-circuits to
+     * [MonitoringReconcileDecision.ALREADY_RUNNING] without re-issuing a start.
+     */
+    fun reconcile(trigger: MonitoringReconcileTrigger): MonitoringReconcileDecision {
+        val decision = decide(trigger)
+        report(trigger, decision)
+        return decision
+    }
+
+    private fun decide(trigger: MonitoringReconcileTrigger): MonitoringReconcileDecision {
+        if (!shouldMonitor()) return MonitoringReconcileDecision.NOT_PAIRED
+        if (isPumpConnectionRunning()) return MonitoringReconcileDecision.ALREADY_RUNNING
+        if (!trigger.foregroundStartIsLegal && !backgroundStartEligibility.isEligible()) {
+            return MonitoringReconcileDecision.DEFERRED_INELIGIBLE
+        }
+        // Rejections are caught, classified, durably recorded and surfaced to the user inside
+        // PumpConnectionService.start/ForegroundServiceStarter -- this only needs the verdict.
+        val result = PumpConnectionService.start(context)
+        return if (result is ForegroundServiceStartResult.Rejected) {
+            MonitoringReconcileDecision.START_REJECTED
+        } else {
+            MonitoringReconcileDecision.STARTED
+        }
+    }
+
+    /**
+     * The credential store is keystore-backed, so a read is not the pure in-memory lookup its
+     * signature suggests; an unreadable store means "we cannot show we are paired", which must
+     * decide against starting rather than propagate out of a receiver.
+     */
+    private fun shouldMonitor(): Boolean =
+        runCatching { pumpCredentialStore.isPaired() }.getOrDefault(false)
+
+    /**
+     * Reads the live service's own state, the same probe [PumpConnectionService.start] uses to
+     * tell a redundant start apart from a real one. An unreadable signal falls back to "not
+     * running": that costs at most one redundant start, while the opposite default would skip a
+     * start monitoring actually needed.
+     *
+     * This is also what keeps a system-initiated `START_STICKY` recreation from double-starting.
+     * The recreation itself is the platform re-delivering `onStartCommand` to a service it
+     * rebuilt, and the service's `started` guard already makes that idempotent; what used to
+     * compound it was the process rebuild running `Application.onCreate`, which fired a second,
+     * unconditional start. With that gone, a reconcile arriving alongside a sticky restart sees
+     * the restarted service here and stops.
+     */
+    private fun isPumpConnectionRunning(): Boolean =
+        runCatching { PumpConnectionService.isRunning() }.getOrDefault(false)
+
+    /**
+     * One line per reconcile, carrying the trigger and the decision and nothing else -- both are
+     * enums, so there is no device or user data to leak into a telemetry event.
+     *
+     * Level is chosen by outcome, because [Timber] is the app's telemetry channel:
+     * `SentryTimberIntegration` is installed at (ERROR event, WARNING breadcrumb), so a decision
+     * that leaves monitoring off when it should be on becomes a breadcrumb attached to whatever
+     * the user reports next, while a routine start or a not-paired no-op stays in logcat. Error
+     * level is left to [FgsTimeoutReporter.recordForegroundStartRejected], which already raises
+     * the real event (class name only) on the rejection path.
+     */
+    private fun report(
+        trigger: MonitoringReconcileTrigger,
+        decision: MonitoringReconcileDecision,
+    ) {
+        if (decision.monitoringOff) {
+            Timber.w(
+                "%s trigger=%s decision=%s -- monitoring is not running",
+                RECONCILE_EVENT_TAG, trigger.name, decision.name,
+            )
+        } else {
+            Timber.i("%s trigger=%s decision=%s", RECONCILE_EVENT_TAG, trigger.name, decision.name)
+        }
+    }
+
+    companion object {
+        /** Stable prefix on every reconcile report, for logcat greps and Sentry search. */
+        const val RECONCILE_EVENT_TAG = "MONITORING_RECONCILE"
+    }
+}
+
+/**
+ * Whether the platform would currently accept a foreground-service start from a caller with no
+ * exemption of its own. Two ways to qualify, mirroring what the platform itself checks: the
+ * process is already at foreground-ish importance (a visible or foreground-service process may
+ * start one), or the app is allowlisted out of battery optimizations, which carries a standing
+ * exemption.
+ *
+ * Its own class rather than two private helpers on [MonitoringReconciler] because it is the one
+ * part of the decision that reads live platform state -- which makes it the part a test has to be
+ * able to pin, and the part GLY-254's watchdog will ask the same question of before it schedules
+ * versus starts.
+ *
+ * Both probes fall back to "not eligible" if they fail. Guessing "eligible" here would put the
+ * illegal start back, which is the entire bug.
+ */
+@Singleton
+class BackgroundStartEligibility @Inject constructor(
+    @ApplicationContext private val context: Context,
+) {
+
+    fun isEligible(): Boolean = isProcessImportanceForeground() || isIgnoringBatteryOptimizations()
+
+    private fun isProcessImportanceForeground(): Boolean = runCatching {
+        val state = ActivityManager.RunningAppProcessInfo().apply {
+            // The no-arg constructor seeds IMPORTANCE_FOREGROUND, so a struct that came back
+            // unfilled would read as the most permissive answer there is. Seed the least
+            // permissive one instead and let the platform overwrite it.
+            importance = ActivityManager.RunningAppProcessInfo.IMPORTANCE_GONE
+        }
+        // getMyMemoryState, not getRunningAppProcesses: the latter is filtered down to the
+        // caller's own process on modern Android anyway, and this variant needs no permission.
+        ActivityManager.getMyMemoryState(state)
+        state.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE
+    }.getOrDefault(false)
+
+    private fun isIgnoringBatteryOptimizations(): Boolean = runCatching {
+        context.getSystemService(PowerManager::class.java)
+            ?.isIgnoringBatteryOptimizations(context.packageName) == true
+    }.getOrDefault(false)
+}
+
+/**
+ * Where a reconcile came from, which is what decides whether it may start a foreground service.
+ *
+ * [foregroundStartIsLegal] means "this context carries its own exemption", not "this start cannot
+ * fail" -- the platform can still refuse for a reason the trigger knows nothing about (an
+ * exhausted budget, a revoked permission), which is why every start still goes through
+ * [ForegroundServiceStarter].
+ */
+enum class MonitoringReconcileTrigger(internal val foregroundStartIsLegal: Boolean) {
+    /** An Activity reached started state, so the app is visibly in the foreground. */
+    APP_FOREGROUNDED(foregroundStartIsLegal = true),
+
+    /**
+     * `ACTION_BOOT_COMPLETED`. Android 15 restricted which foreground-service types may be
+     * started from this broadcast; `connectedDevice`, the type [PumpConnectionService] declares,
+     * is one of the types still allowed.
+     */
+    BOOT_COMPLETED(foregroundStartIsLegal = true),
+
+    /**
+     * Any trigger with no legal-context guarantee -- the periodic watchdog GLY-254 adds is the
+     * intended user. Eligibility is probed before a start is attempted.
+     */
+    BACKGROUND(foregroundStartIsLegal = false),
+}
+
+/**
+ * What a reconcile concluded. [monitoringOff] marks the ones that leave pump monitoring not
+ * running when it should be, which is what makes a reconcile worth reporting as telemetry rather
+ * than a debug log.
+ */
+enum class MonitoringReconcileDecision(internal val monitoringOff: Boolean) {
+    /** A start was issued and accepted. */
+    STARTED(monitoringOff = false),
+
+    /** The service is already up; nothing to do. */
+    ALREADY_RUNNING(monitoringOff = false),
+
+    /** No pump is paired, so there is nothing to monitor. */
+    NOT_PAIRED(monitoringOff = false),
+
+    /** A background trigger with no exemption: left for the next legal trigger to pick up. */
+    DEFERRED_INELIGIBLE(monitoringOff = true),
+
+    /** The start was attempted from a legal-looking context and the platform refused it anyway. */
+    START_REJECTED(monitoringOff = true),
+}
