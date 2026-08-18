@@ -369,7 +369,8 @@ class PumpPollingOrchestrator @Inject constructor(
             // Only a fault not yet seen in this outage, and the laddered reminders, go to ERROR:
             // the loop keeps iterating through a failure by design, so an undamped report would
             // ship one Sentry event per iteration for as long as the fault lasts. See
-            // [PollLoopHealth.opensFailureReport]; the recovery WARN closes the outage either way.
+            // [PollLoopHealth.opensFailureReport]. Nothing is lost on the device: the damped
+            // repeats are logged below with the throwable, and every report carries `since_ok=`.
             if (before.opensFailureReport(PollLoopHealth.failureKind(step, e))) {
                 Timber.e(
                     "Poll step failed (loop=%s step=%s cause=%s); continuing loop [%s]",
@@ -401,9 +402,15 @@ class PumpPollingOrchestrator @Inject constructor(
      * Publishes the loop's heartbeat for an iteration in which every step succeeded, and reports
      * the recovering edge when the loop had been failing.
      *
-     * Only the recovery is logged, at WARN so it reaches telemetry: a healthy heartbeat every 15
-     * seconds would be pure noise, while "the slow loop is polling again after 6 failures and 31
-     * minutes dark" is the other half of the failure event that opened the outage.
+     * Only the recovery is logged: a healthy heartbeat every 15 seconds would be pure noise, while
+     * "the slow loop is polling again after 6 failures and 31 minutes dark" is the other half of
+     * the failure that opened the outage.
+     *
+     * WARN, not ERROR, and that is a real limit worth stating: WARN is Sentry's breadcrumb
+     * threshold, so this line rides along with a *later* event rather than raising one of its own.
+     * A recovery is not an error and must not bill an event, so remotely the "is it still dark"
+     * answer comes from `last_ok=` in the next report and, once GLY-254 lands, from the watchdog —
+     * not from this line.
      */
     private fun markIterationSucceeded(loop: PollLoop) {
         val nowMs = System.currentTimeMillis()

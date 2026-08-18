@@ -109,8 +109,9 @@ data class PollLoopHealth(
      * events instead of ~5,700, and the doubling needs no per-loop tuning because it follows each
      * loop's own cadence.
      *
-     * Everything else is logged on-device at DEBUG with the throwable attached, and the recovery
-     * WARN closes the outage either way.
+     * Everything else is logged on-device at DEBUG with the throwable attached. Damping costs
+     * nothing remotely either: every report that does ship carries `since_ok=` from
+     * [telemetrySummary], so an event says how long the outage has run, not just that it exists.
      */
     fun opensFailureReport(failureKind: String): Boolean {
         if (failureKind !in failureKindsThisOutage) return true
