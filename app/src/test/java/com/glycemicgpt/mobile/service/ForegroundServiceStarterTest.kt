@@ -10,6 +10,7 @@ import androidx.core.app.NotificationCompat
 import androidx.test.core.app.ApplicationProvider
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -58,7 +59,11 @@ class ForegroundServiceStarterTest {
         val result = ForegroundServiceStarter.start(context, Intent(), COMPONENT)
 
         assertEquals(ForegroundServiceStartResult.Started, result)
-        assertFalse(reporter.isResumePending(COMPONENT))
+        assertFalse(reporter.isStartRejectedPending(COMPONENT))
+        // Pins the exact "start gets swallowed" regression this helper exists to prevent: a
+        // Started result with no underlying platform call would pass without this (GLY-246
+        // review F8).
+        verify { context.startForegroundService(any()) }
     }
 
     @Test
@@ -71,11 +76,11 @@ class ForegroundServiceStarterTest {
         val result = ForegroundServiceStarter.start(context, Intent(), COMPONENT)
 
         assertEquals(
-            ForegroundServiceStartResult.Rejected(COMPONENT, "IllegalStateException"),
+            ForegroundServiceStartResult.Rejected(COMPONENT, "IllegalStateException", ForegroundStartRejectionReason.BUDGET_EXHAUSTED),
             result,
         )
-        assertTrue(reporter.isResumePending(COMPONENT))
-        assertTrue(reporter.lastTimeoutAtMs(COMPONENT) > 0L)
+        assertTrue(reporter.isStartRejectedPending(COMPONENT))
+        assertTrue(reporter.lastStartRejectedAtMs(COMPONENT) > 0L)
     }
 
     @Test
@@ -88,10 +93,10 @@ class ForegroundServiceStarterTest {
         val result = ForegroundServiceStarter.start(context, Intent(), COMPONENT)
 
         assertEquals(
-            ForegroundServiceStartResult.Rejected(COMPONENT, "SecurityException"),
+            ForegroundServiceStartResult.Rejected(COMPONENT, "SecurityException", ForegroundStartRejectionReason.PERMISSION_DENIED),
             result,
         )
-        assertTrue(reporter.isResumePending(COMPONENT))
+        assertTrue(reporter.isStartRejectedPending(COMPONENT))
     }
 
     // --- promote(service, ...): the in-service Service.startForeground call shape ---
@@ -105,7 +110,19 @@ class ForegroundServiceStarterTest {
         )
 
         assertEquals(ForegroundServiceStartResult.Started, result)
-        assertFalse(reporter.isResumePending(COMPONENT))
+        assertFalse(reporter.isStartRejectedPending(COMPONENT))
+        verify { service.startForeground(NOTIFICATION_ID, any()) }
+    }
+
+    @Test
+    fun `promote clears an earlier start-rejected marker on success`() {
+        reporter.recordForegroundStartRejected(COMPONENT, IllegalStateException("budget exhausted"))
+        assertTrue(reporter.isStartRejectedPending(COMPONENT))
+        val service = mockk<Service>(relaxed = true)
+
+        ForegroundServiceStarter.promote(service, NOTIFICATION_ID, testNotification(), COMPONENT, reporter)
+
+        assertFalse(reporter.isStartRejectedPending(COMPONENT))
     }
 
     @Test
@@ -119,10 +136,10 @@ class ForegroundServiceStarterTest {
         )
 
         assertEquals(
-            ForegroundServiceStartResult.Rejected(COMPONENT, "IllegalStateException"),
+            ForegroundServiceStartResult.Rejected(COMPONENT, "IllegalStateException", ForegroundStartRejectionReason.BUDGET_EXHAUSTED),
             result,
         )
-        assertTrue(reporter.isResumePending(COMPONENT))
+        assertTrue(reporter.isStartRejectedPending(COMPONENT))
     }
 
     @Test
@@ -136,10 +153,29 @@ class ForegroundServiceStarterTest {
         )
 
         assertEquals(
-            ForegroundServiceStartResult.Rejected(COMPONENT, "SecurityException"),
+            ForegroundServiceStartResult.Rejected(COMPONENT, "SecurityException", ForegroundStartRejectionReason.PERMISSION_DENIED),
             result,
         )
-        assertTrue(reporter.isResumePending(COMPONENT))
+        assertTrue(reporter.isStartRejectedPending(COMPONENT))
+    }
+
+    @Test
+    fun `promote with a foreground service type succeeds and calls the 3-arg overload`() {
+        val service = mockk<Service>(relaxed = true)
+
+        val result = ForegroundServiceStarter.promote(
+            service,
+            NOTIFICATION_ID,
+            testNotification(),
+            COMPONENT,
+            reporter,
+            foregroundServiceType = DATA_SYNC_TYPE,
+        )
+
+        assertEquals(ForegroundServiceStartResult.Started, result)
+        // Discriminates which overload actually ran: a stray 2-arg call here would leave this
+        // unverified and still return Started (GLY-246 review F8).
+        verify { service.startForeground(NOTIFICATION_ID, any(), DATA_SYNC_TYPE) }
     }
 
     @Test
@@ -159,7 +195,7 @@ class ForegroundServiceStarterTest {
         )
 
         assertEquals(
-            ForegroundServiceStartResult.Rejected(COMPONENT, "IllegalStateException"),
+            ForegroundServiceStartResult.Rejected(COMPONENT, "IllegalStateException", ForegroundStartRejectionReason.BUDGET_EXHAUSTED),
             result,
         )
     }

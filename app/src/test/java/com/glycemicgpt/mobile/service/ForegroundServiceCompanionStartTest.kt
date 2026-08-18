@@ -7,6 +7,7 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import io.mockk.every
 import io.mockk.mockk
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -35,29 +36,78 @@ class ForegroundServiceCompanionStartTest {
     }
 
     @Test
-    fun `PumpConnectionService start survives a platform rejection and tags the pump component`() {
-        val context = rejectingContext()
+    fun `PumpConnectionService start survives an IllegalStateException and tags the pump component`() {
+        val context = rejectingContext(IllegalStateException("dataSync budget exhausted"))
 
-        PumpConnectionService.start(context)
+        val result = PumpConnectionService.start(context)
 
-        assertTrue(reporter.isResumePending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION))
+        assertEquals(
+            ForegroundServiceStartResult.Rejected(
+                FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                "IllegalStateException",
+                ForegroundStartRejectionReason.BUDGET_EXHAUSTED,
+            ),
+            result,
+        )
+        assertTrue(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION))
     }
 
     @Test
-    fun `AlertStreamService start survives a platform rejection and tags the alert stream component`() {
-        val context = rejectingContext()
+    fun `PumpConnectionService start survives a SecurityException and tags the pump component`() {
+        val context = rejectingContext(SecurityException("missing permission"))
 
-        AlertStreamService.start(context)
+        val result = PumpConnectionService.start(context)
 
-        assertTrue(reporter.isResumePending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM))
+        assertEquals(
+            ForegroundServiceStartResult.Rejected(
+                FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                "SecurityException",
+                ForegroundStartRejectionReason.PERMISSION_DENIED,
+            ),
+            result,
+        )
+        assertTrue(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION))
     }
 
-    private fun rejectingContext(): Context {
+    @Test
+    fun `AlertStreamService start survives an IllegalStateException and tags the alert stream component`() {
+        val context = rejectingContext(IllegalStateException("dataSync budget exhausted"))
+
+        val result = AlertStreamService.start(context)
+
+        assertEquals(
+            ForegroundServiceStartResult.Rejected(
+                FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+                "IllegalStateException",
+                ForegroundStartRejectionReason.BUDGET_EXHAUSTED,
+            ),
+            result,
+        )
+        assertTrue(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM))
+    }
+
+    @Test
+    fun `AlertStreamService start survives a SecurityException and tags the alert stream component`() {
+        val context = rejectingContext(SecurityException("missing permission"))
+
+        val result = AlertStreamService.start(context)
+
+        assertEquals(
+            ForegroundServiceStartResult.Rejected(
+                FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+                "SecurityException",
+                ForegroundStartRejectionReason.PERMISSION_DENIED,
+            ),
+            result,
+        )
+        assertTrue(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM))
+    }
+
+    private fun rejectingContext(error: Throwable): Context {
         val appContext: Context = ApplicationProvider.getApplicationContext()
         return mockk<Context>(relaxed = true) {
             every { applicationContext } returns appContext
-            every { startForegroundService(any()) } throws
-                IllegalStateException("dataSync budget exhausted")
+            every { startForegroundService(any()) } throws error
         }
     }
 }
