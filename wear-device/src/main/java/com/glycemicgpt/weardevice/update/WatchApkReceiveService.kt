@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.ServiceInfo
+import android.os.Build
+import androidx.annotation.RequiresApi
 import com.glycemicgpt.weardevice.data.FgsTimeoutReporter
 import com.glycemicgpt.weardevice.data.WearDataContract
 import com.google.android.gms.wearable.ChannelClient
@@ -82,6 +84,7 @@ class WatchApkReceiveService : WearableListenerService() {
      * half-received APK is never committed to PackageInstaller, and the phone re-pushes on the
      * next update check, so nothing is persisted for resume.
      */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     override fun onTimeout(startId: Int, fgsType: Int) {
         scope.coroutineContext.cancelChildren()
         synchronized(foregroundLock) {
@@ -125,7 +128,14 @@ class WatchApkReceiveService : WearableListenerService() {
                 }
             } finally {
                 synchronized(foregroundLock) {
-                    if (activePushCount.decrementAndGet() == 0) {
+                    // <= 0, not == 0: [onTimeout] zeroes the counter out-of-band while this
+                    // transfer is still unwinding, so this decrement can land on an already-zero
+                    // counter. An exact-equality test would leave it negative and GMS keeps the
+                    // instance bound, so every later APK push would skip tryPromoteToForeground
+                    // and transfer (up to 100 MB) with no foreground protection. Same clamp the
+                    // phone relay's finishWork has.
+                    if (activePushCount.decrementAndGet() <= 0) {
+                        activePushCount.set(0)
                         stopForeground(STOP_FOREGROUND_REMOVE)
                     }
                 }

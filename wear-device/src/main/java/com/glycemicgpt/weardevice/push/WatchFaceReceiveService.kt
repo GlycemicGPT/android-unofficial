@@ -4,6 +4,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.pm.ServiceInfo
+import android.os.Build
+import androidx.annotation.RequiresApi
 import com.glycemicgpt.weardevice.data.FgsTimeoutReporter
 import com.glycemicgpt.weardevice.data.WearDataContract
 import com.google.android.gms.wearable.ChannelClient
@@ -77,6 +79,7 @@ class WatchFaceReceiveService : WearableListenerService() {
      * interrupted by cancelling its coroutine, which is what the receive watchdog is for. The
      * phone re-pushes the face when the user asks again, so nothing is persisted for resume.
      */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     override fun onTimeout(startId: Int, fgsType: Int) {
         scope.coroutineContext.cancelChildren()
         synchronized(foregroundLock) {
@@ -122,7 +125,13 @@ class WatchFaceReceiveService : WearableListenerService() {
                 }
             } finally {
                 synchronized(foregroundLock) {
-                    if (activePushCount.decrementAndGet() == 0) {
+                    // <= 0, not == 0: [onTimeout] zeroes the counter out-of-band while this push
+                    // is still unwinding, so this decrement can land on an already-zero counter.
+                    // An exact-equality test would leave it negative and GMS keeps the instance
+                    // bound, so every later push would skip tryPromoteToForeground and transfer
+                    // with no foreground protection. Same clamp the phone relay's finishWork has.
+                    if (activePushCount.decrementAndGet() <= 0) {
+                        activePushCount.set(0)
                         stopForeground(STOP_FOREGROUND_REMOVE)
                     }
                 }
