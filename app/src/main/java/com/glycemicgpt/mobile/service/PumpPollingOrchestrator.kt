@@ -140,7 +140,14 @@ class PumpPollingOrchestrator @Inject constructor(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    Timber.e(e, "Failed to read the history resume anchor; the slow loop will retry")
+                    // Exception class only at ERROR, throwable at DEBUG — same discipline as
+                    // [runStep]: this is a Room/SQLCipher failure, and its message can quote the
+                    // failing statement or row, which is history-log data.
+                    Timber.e(
+                        "Failed to read the history resume anchor (%s); the slow loop will retry",
+                        e.javaClass.simpleName,
+                    )
+                    Timber.d(e, "History resume anchor read failure detail")
                 }
 
                 pumpDriver.observeConnectionState().collectLatest { state ->
