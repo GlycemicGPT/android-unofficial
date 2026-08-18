@@ -43,19 +43,13 @@ class BootCompletedReceiver : BroadcastReceiver() {
                 Timber.d("Boot completed, pump not paired -- skipping PumpConnectionService")
             }
 
-            // Start AlertStreamService if the user is logged in so alerts resume after reboot
+            // Start AlertStreamService if the user is logged in so alerts resume after reboot.
+            // AlertStreamService.start already routes through ForegroundServiceStarter, which
+            // catches and records a platform rejection instead of throwing -- nothing left to
+            // catch here.
             if (authTokenStore.getRefreshToken() != null) {
-                try {
-                    Timber.d("Boot completed, starting AlertStreamService (user is logged in)")
-                    AlertStreamService.start(context)
-                } catch (e: IllegalStateException) {
-                    // Covers ForegroundServiceStartNotAllowedException (API 31+) and
-                    // background-start restrictions (API 26+)
-                    Timber.w(e, "Failed to start AlertStreamService on boot")
-                } catch (e: SecurityException) {
-                    // Missing FOREGROUND_SERVICE permission
-                    Timber.w(e, "Failed to start AlertStreamService on boot (missing permission)")
-                }
+                Timber.d("Boot completed, starting AlertStreamService (user is logged in)")
+                AlertStreamService.start(context)
             } else {
                 Timber.d("Boot completed, user not logged in -- skipping AlertStreamService")
             }

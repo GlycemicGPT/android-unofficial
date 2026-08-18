@@ -12,6 +12,8 @@ import com.glycemicgpt.mobile.data.local.AuthTokenStore
 import com.glycemicgpt.mobile.data.repository.AlertRepository
 import com.glycemicgpt.mobile.data.repository.ChatRepository
 import com.glycemicgpt.mobile.service.FgsTimeoutReporter
+import com.glycemicgpt.mobile.service.ForegroundServiceStartResult
+import com.glycemicgpt.mobile.service.ForegroundServiceStarter
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.WearableListenerService
@@ -54,7 +56,8 @@ class WearChatRelayService : WearableListenerService() {
     internal val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** Tracks active foreground work items. Only stop foreground when count hits 0. */
-    private val activeWorkCount = AtomicInteger(0)
+    @VisibleForTesting
+    internal val activeWorkCount = AtomicInteger(0)
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
         when (messageEvent.path) {
@@ -184,27 +187,33 @@ class WearChatRelayService : WearableListenerService() {
      * Uses an atomic counter so concurrent work items (e.g., chat + alert dismiss
      * arriving simultaneously) keep the foreground state until ALL complete.
      */
-    private fun startWork() {
+    @VisibleForTesting
+    internal fun startWork() {
         if (activeWorkCount.getAndIncrement() == 0) {
             ensureNotificationChannel()
             val notification = buildNotification()
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-                } else {
-                    startForeground(NOTIFICATION_ID, notification)
+            val foregroundServiceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            } else {
+                null
+            }
+            val result = ForegroundServiceStarter.promote(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
+                fgsTimeoutReporter,
+                foregroundServiceType,
+            )
+            when (result) {
+                ForegroundServiceStartResult.Started -> Timber.d("Chat relay promoted to foreground")
+                is ForegroundServiceStartResult.Rejected -> {
+                    // Android 15 refuses a dataSync promotion once the shared 24 h budget is spent
+                    // (ForegroundServiceStartNotAllowedException, an IllegalStateException). An
+                    // uncaught throw here would crash the process and take the pump connection with
+                    // it, over a watch chat message. Relay the request unprotected instead -- the
+                    // same trade the watch-side receivers already make.
                 }
-                Timber.d("Chat relay promoted to foreground")
-            } catch (e: IllegalStateException) {
-                // Android 15 refuses a dataSync promotion once the shared 24 h budget is spent
-                // (ForegroundServiceStartNotAllowedException, an IllegalStateException). An
-                // uncaught throw here would crash the process and take the pump connection with
-                // it, over a watch chat message. Relay the request unprotected instead -- the
-                // same trade the watch-side receivers already make.
-                fgsTimeoutReporter.recordForegroundStartRejected(
-                    FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
-                    e,
-                )
             }
         }
     }

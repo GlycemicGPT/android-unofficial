@@ -9,6 +9,7 @@ import com.glycemicgpt.mobile.domain.plugin.PairingProfile
 import com.glycemicgpt.mobile.domain.plugin.PairingStyle
 import com.glycemicgpt.mobile.domain.pump.PumpConnectionManager
 import com.glycemicgpt.mobile.domain.pump.PumpScanner
+import com.glycemicgpt.mobile.service.ForegroundServiceStartResult
 import com.glycemicgpt.mobile.service.PumpConnectionService
 import io.mockk.every
 import io.mockk.mockk
@@ -57,7 +58,7 @@ class PairingViewModelTest {
         Dispatchers.setMain(testDispatcher)
         // PumpConnectionService.start/stop construct Android Intents; stub them out.
         mockkObject(PumpConnectionService.Companion)
-        every { PumpConnectionService.start(any()) } returns Unit
+        every { PumpConnectionService.start(any()) } returns ForegroundServiceStartResult.Started
         every { PumpConnectionService.stop(any()) } returns Unit
     }
 

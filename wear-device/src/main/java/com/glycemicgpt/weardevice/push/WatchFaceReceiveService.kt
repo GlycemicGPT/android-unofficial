@@ -7,6 +7,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
 import com.glycemicgpt.weardevice.data.FgsTimeoutReporter
+import com.glycemicgpt.weardevice.data.ForegroundServiceStarter
 import com.glycemicgpt.weardevice.data.WearDataContract
 import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.Wearable
@@ -139,6 +140,13 @@ class WatchFaceReceiveService : WearableListenerService() {
         }
     }
 
+    /**
+     * The narrower [ForegroundServiceStarter] catch only classifies the platform's own rejection
+     * types; this outer catch is the backstop the pre-GLY-246 code had (channel creation and
+     * notification build ran inside the same `catch (e: Exception)` as the promotion call), kept
+     * so an unexpected throw here still can't escape a `WearableListenerService` callback with no
+     * enclosing try/catch of its own.
+     */
     private fun tryPromoteToForeground() {
         try {
             val nm = getSystemService(NotificationManager::class.java)
@@ -156,9 +164,22 @@ class WatchFaceReceiveService : WearableListenerService() {
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setOngoing(true)
                 .build()
-            startForeground(FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            ForegroundServiceStarter.promote(
+                this,
+                FOREGROUND_ID,
+                notification,
+                FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
         } catch (e: Exception) {
-            Timber.w(e, "Failed to promote to foreground, continuing without protection")
+            Timber.e(e, "Unexpected failure promoting watch face receive to foreground")
+            // Not recordForegroundStartRejected: everything this backstop catches came from the
+            // notification setup above, or is an exception type ForegroundServiceStarter does not
+            // classify -- neither is the platform refusing the start (PR #44 review).
+            FgsTimeoutReporter.recordForegroundSetupFailure(
+                FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
+                e,
+            )
         }
     }
 

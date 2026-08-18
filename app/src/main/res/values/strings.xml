@@ -6,4 +6,7 @@
     <string name="pump_service_floor_watching_text">Server alerts paused — this phone is watching for lows and highs</string>
     <string name="pump_service_floor_watching_no_server_text">This phone is watching for lows and highs</string>
     <string name="pump_service_floor_not_watching_text">Alerts degraded — this phone is NOT watching for lows or highs</string>
+    <string name="monitoring_degraded_title">Monitoring not running</string>
+    <string name="monitoring_degraded_pump_text">The system refused to keep pump monitoring running. Open the app to try reconnecting.</string>
+    <string name="monitoring_degraded_alert_stream_text">The system refused to keep alert delivery running. Open the app to try reconnecting.</string>
 </resources>

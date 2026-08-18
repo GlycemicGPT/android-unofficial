@@ -69,17 +69,69 @@ class FgsTimeoutReporter @Inject constructor(
     }
 
     /**
-     * The system refused to promote [component] to a `dataSync` foreground service, which on
-     * Android 15 is what happens to every start attempt after the budget is spent. Reported at
-     * error level for the same reason as a timeout: it means the app is running without the
-     * protection it thinks it has.
+     * The system refused to start or promote [component] to a foreground service -- a background
+     * start restriction (API 26+), a `BOOT_COMPLETED` type restriction (Android 15), the exhausted
+     * `dataSync` budget (Android 15), or a missing permission. Reported at error level for the same
+     * reason as a timeout: it means the app is running without the protection it thinks it has.
+     *
+     * Deliberately its own key space, distinct from [recordTimeout]'s
+     * ([keyLastTimeoutAtMs]/[keyTimeoutCount]/[keyResumePending]): a start rejection and a mid-run
+     * timeout are different events with different resume implications (GLY-246 review F4) --
+     * merging them let [lastTimeoutAtMs] read non-zero while [timeoutCount] stayed zero, a
+     * combination [recordTimeout] alone can never produce. [isStartRejectedPending] is cleared by
+     * [clearStartRejectedPending] on that component's next successful promotion (see
+     * [ForegroundServiceStarter]), so it cannot latch on forever the way sharing
+     * [keyResumePending] did.
+     *
+     * `Timber.e` takes the exception class and a classified [ForegroundStartRejectionReason], not
+     * the throwable -- same discipline as
+     * [com.glycemicgpt.mobile.service.PumpPollingOrchestrator]'s exception logging (GLY-249): an
+     * ERROR-level Timber call is promoted to a real Sentry event, and the raw message can carry
+     * data (e.g. permission details) that does not belong in a telemetry event. The full
+     * throwable still goes to DEBUG for local troubleshooting. Uses [START_REJECTED_EVENT_TAG],
+     * not [EVENT_TAG]: [EVENT_TAG] documents the `dataSync` budget specifically, and a
+     * `connectedDevice` rejection (e.g. [COMPONENT_PUMP_CONNECTION]) filed under it would
+     * mis-attribute the cause during an incident (GLY-246 review F7).
      */
-    fun recordForegroundStartRejected(component: String, error: Throwable) {
+    fun recordForegroundStartRejected(
+        component: String,
+        error: Throwable,
+        nowMs: Long = System.currentTimeMillis(),
+    ): ForegroundStartRejectionReason {
+        val reason = ForegroundStartRejectionReason.classify(error)
+        prefs.edit()
+            .putLong(keyLastStartRejectedAtMs(component), nowMs)
+            .putBoolean(keyStartRejectedPending(component), true)
+            // commit(), unlike recordTimeout's apply(): a rejection lands on the cold/background
+            // path where the process can be killed moments later, and this marker is the whole
+            // point of the record -- an async flush that never reaches disk loses it. Not a hot
+            // path, so the synchronous write costs nothing that matters (PR #44 review).
+            .commit()
         Timber.e(
-            error,
-            "%s_START_REJECTED component=%s -- dataSync foreground start refused by the system",
-            EVENT_TAG, component,
+            "%s component=%s exceptionType=%s reason=%s -- foreground start refused by the system",
+            START_REJECTED_EVENT_TAG, component, error.javaClass.simpleName, reason.name,
         )
+        Timber.d(error, "%s detail for component=%s", START_REJECTED_EVENT_TAG, component)
+        return reason
+    }
+
+    /** Wall-clock ms of the last recorded start rejection for [component], or 0 if none. */
+    fun lastStartRejectedAtMs(component: String): Long =
+        prefs.getLong(keyLastStartRejectedAtMs(component), 0L)
+
+    /** True while [component]'s last foreground-start attempt was rejected and never resumed. */
+    fun isStartRejectedPending(component: String): Boolean =
+        prefs.getBoolean(keyStartRejectedPending(component), false)
+
+    /**
+     * Called once [component] successfully promotes to foreground again. Every component clears
+     * its own marker this way (see [ForegroundServiceStarter.promote]) -- not just the alert
+     * stream, which was the only caller before GLY-246 review F4.
+     */
+    fun clearStartRejectedPending(component: String) {
+        if (!isStartRejectedPending(component)) return
+        prefs.edit().putBoolean(keyStartRejectedPending(component), false).apply()
+        Timber.d("%s promoted to foreground; cleared the start-rejected marker", component)
     }
 
     /** Wall-clock ms of the last recorded timeout for [component], or 0 if it never timed out. */
@@ -111,13 +163,62 @@ class FgsTimeoutReporter @Inject constructor(
 
     private fun keyResumePending(component: String) = "${component}_resume_pending"
 
+    private fun keyLastStartRejectedAtMs(component: String) = "${component}_start_rejected_at_ms"
+
+    private fun keyStartRejectedPending(component: String) = "${component}_start_rejected_pending"
+
     companion object {
-        /** Stable prefix on every timeout report, for logcat greps and Sentry search. */
+        /** Stable prefix on every mid-run `dataSync` timeout report, for logcat greps and Sentry search. */
         const val EVENT_TAG = "FGS_DATASYNC_TIMEOUT"
+
+        /**
+         * Stable prefix on every start-rejection report. Separate from [EVENT_TAG]: a rejection
+         * can hit a `connectedDevice` service too, which never touches the `dataSync` budget
+         * [EVENT_TAG] documents (GLY-246 review F7).
+         */
+        const val START_REJECTED_EVENT_TAG = "FGS_START_REJECTED"
 
         const val COMPONENT_ALERT_STREAM = "alert_stream"
         const val COMPONENT_WEAR_CHAT_RELAY = "wear_chat_relay"
+        const val COMPONENT_PUMP_CONNECTION = "pump_connection"
 
         private const val PREFS_NAME = "fgs_timeout"
+    }
+}
+
+/**
+ * The platform cause behind a rejected foreground-service start (GLY-246 review F3). All three
+ * causes the Linear issue names -- a background-start restriction (API 26+), a `BOOT_COMPLETED`
+ * type restriction (Android 15), and the exhausted `dataSync` budget (Android 15) -- throw the
+ * identical [ForegroundServiceStartNotAllowedException][java.lang.IllegalStateException] (an
+ * `IllegalStateException` subclass), so the exception's class name alone cannot tell them apart;
+ * only its message text can. Classification matches specific, narrow substrings pulled from real
+ * platform message text (e.g. `mAllowStartForeground`, the field name the background-start
+ * restriction's message names, captured from DropBox evidence in GLY-247) rather than generic
+ * phrases like "not allowed due to" or "background" that multiple distinct rejection reasons
+ * could plausibly share. A message that matches none of them falls back to [OTHER] instead of
+ * guessing -- for telemetry whose purpose is deciding which fix to ship, a confidently wrong
+ * label is worse than an honest "unknown".
+ */
+enum class ForegroundStartRejectionReason {
+    BUDGET_EXHAUSTED,
+    BOOT_TYPE_RESTRICTION,
+    BACKGROUND_START_RESTRICTION,
+    PERMISSION_DENIED,
+    OTHER,
+    ;
+
+    companion object {
+        fun classify(error: Throwable): ForegroundStartRejectionReason {
+            if (error is SecurityException) return PERMISSION_DENIED
+            val message = error.message.orEmpty()
+            return when {
+                message.contains("time limit", ignoreCase = true) ||
+                    message.contains("budget", ignoreCase = true) -> BUDGET_EXHAUSTED
+                message.contains("BOOT_COMPLETED", ignoreCase = true) -> BOOT_TYPE_RESTRICTION
+                message.contains("mAllowStartForeground", ignoreCase = true) -> BACKGROUND_START_RESTRICTION
+                else -> OTHER
+            }
+        }
     }
 }

@@ -6,7 +6,14 @@ import android.app.Application
 import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import com.glycemicgpt.mobile.service.FgsTimeoutReporter
+import com.glycemicgpt.mobile.service.ForegroundServiceStartResult
+import com.glycemicgpt.mobile.service.ForegroundServiceStarter
+import com.glycemicgpt.mobile.service.ForegroundStartRejectionReason
+import io.mockk.every
+import io.mockk.mockkObject
+import io.mockk.unmockkObject
 import kotlinx.coroutines.launch
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -41,6 +48,32 @@ class WearChatRelayServiceTimeoutTest {
         service = Robolectric.buildService(WearChatRelayService::class.java).get().apply {
             fgsTimeoutReporter = reporter
         }
+    }
+
+    @After
+    fun tearDown() {
+        unmockkObject(ForegroundServiceStarter)
+    }
+
+    @Test
+    fun `startWork survives a rejected promotion and relays unprotected`() {
+        // GLY-246 review F5: unlike the pump and alert-stream services, the relay's own trade
+        // (see startWork's Rejected branch) is to keep going without foreground protection rather
+        // than stop -- a watch chat message is not worth crashing the process over. This pins
+        // that a rejection neither stops the service nor blocks the work item from being counted.
+        mockkObject(ForegroundServiceStarter)
+        every {
+            ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
+        } returns ForegroundServiceStartResult.Rejected(
+            FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
+            "IllegalStateException",
+            ForegroundStartRejectionReason.BUDGET_EXHAUSTED,
+        )
+
+        service.startWork()
+
+        assertFalse(shadowOf(service).isStoppedBySelf)
+        assertEquals(1, service.activeWorkCount.get())
     }
 
     @Test
