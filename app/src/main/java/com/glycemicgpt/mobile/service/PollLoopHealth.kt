@@ -63,6 +63,11 @@ enum class PollStep(val loop: PollLoop, val telemetryName: String) {
  *   healthy loop, and the length of the current outage on a broken one. Reset by
  *   [PollLoopHealthTracker.recordIterationSuccess], which is what lets the orchestrator report the
  *   recovering edge of an outage and not just its start.
+ * @param failureKindsThisOutage the distinct faults seen since the heartbeat last advanced, each
+ *   keyed as `step/ExceptionClass` (or [PollLoopHealth.LOOP_BODY] for a failure outside any step).
+ *   [failuresSinceLastSuccess] counts how long the outage is; this says how many different things
+ *   are wrong, which is what keeps a new fault from being damped into silence by an old one.
+ *   Cleared alongside the counter on recovery.
  * @param restartCount how many times the supervisor has relaunched this loop this session. A
  *   non-zero value means something threw where nothing should have.
  * @param sessionId identifies the loop job these numbers belong to. A cancelled job runs its
@@ -82,8 +87,36 @@ data class PollLoopHealth(
     val lastFailureMessage: String? = null,
     val failureCount: Long = 0,
     val failuresSinceLastSuccess: Long = 0,
+    val failureKindsThisOutage: Set<String> = emptySet(),
     val restartCount: Long = 0,
 ) {
+
+    /**
+     * Whether the failure recorded immediately AFTER this snapshot is worth an ERROR — which
+     * `SentryInitializer` forwards as a Sentry event — or is a repeat that belongs at DEBUG.
+     * [failureKind] identifies the fault being recorded — see [failureKindsThisOutage].
+     *
+     * A loop now keeps iterating through a failing step by design, so a durable fault (a SQLCipher
+     * write that never succeeds, a parser that rejects every record) would otherwise emit one event
+     * per iteration: four a minute on the fast loop, for as long as the pump stays connected. That
+     * exhausts the event quota, costs battery and network, and buries unrelated errors.
+     *
+     * Two things are worth an event. **A fault not yet seen in this outage** — a different step, or
+     * the same step throwing a different exception class — because the first sighting of a fault is
+     * the whole point of the report, and a loop that has been failing for hours must not swallow a
+     * new one. And **the ladder**: failures 1, 2, 4, 8, 16... of the outage, so a long outage stays
+     * visible without growing linearly with its length. A day-long fast-loop outage costs ~13
+     * events instead of ~5,700, and the doubling needs no per-loop tuning because it follows each
+     * loop's own cadence.
+     *
+     * Everything else is logged on-device at DEBUG with the throwable attached, and the recovery
+     * WARN closes the outage either way.
+     */
+    fun opensFailureReport(failureKind: String): Boolean {
+        if (failureKind !in failureKindsThisOutage) return true
+        val ordinal = failuresSinceLastSuccess + 1
+        return (ordinal and (ordinal - 1)) == 0L
+    }
 
     /**
      * Compact liveness line for telemetry. Attached to every failure and restart report so a
@@ -91,26 +124,6 @@ data class PollLoopHealth(
      * only means something next to the failure that froze it. Counters and durations only: no
      * reading values, nothing that could carry PHI through the log pipeline.
      */
-    /**
-     * Whether the failure recorded immediately AFTER this snapshot is worth an ERROR — which
-     * `SentryInitializer` forwards as a Sentry event — or is a repeat that belongs at DEBUG.
-     *
-     * A loop now keeps iterating through a failing step by design, so a durable fault (a SQLCipher
-     * write that never succeeds, a parser that rejects every record) would otherwise emit one event
-     * per iteration: four a minute on the fast loop, for as long as the pump stays connected. That
-     * exhausts the event quota, costs battery and network, and buries unrelated errors.
-     *
-     * So: report the opening edge of an outage, then exponentially rarer reminders — failures 1, 2,
-     * 4, 8, 16... of the current outage. A day-long fast-loop outage costs ~13 events instead of
-     * ~5,700; the reminders keep a long outage from vanishing from telemetry entirely; and the
-     * spacing needs no per-loop tuning, because it follows each loop's own cadence. Everything in
-     * between is logged on-device at DEBUG, and the recovery WARN still closes the outage.
-     */
-    fun opensFailureReport(): Boolean {
-        val ordinal = failuresSinceLastSuccess + 1
-        return (ordinal and (ordinal - 1)) == 0L
-    }
-
     fun telemetrySummary(nowMs: Long = System.currentTimeMillis()): String = buildString {
         append("last_ok=")
         append(lastSuccessAtMs?.let { "${nowMs - it}ms_ago" } ?: "never")
@@ -122,6 +135,20 @@ data class PollLoopHealth(
 
     companion object {
         const val NO_SESSION = 0L
+
+        /** Stands in for the step in a [failureKindsThisOutage] key when the loop body itself threw. */
+        const val LOOP_BODY = "loop_body"
+
+        /**
+         * The key a failure is deduplicated under while an outage lasts: which step, and what it
+         * threw. The exception class is part of it because the same step failing a new way is a new
+         * fault worth an event — a step that starts throwing `SQLiteFullException` where it used to
+         * throw `ParseException` is not the outage anyone is already looking at. Class only, never
+         * the message: these keys ride into a Sentry event, and a parser or Room message can quote
+         * a reading.
+         */
+        fun failureKind(step: PollStep?, error: Throwable?): String =
+            "${step?.telemetryName ?: LOOP_BODY}/${error?.javaClass?.simpleName ?: "none"}"
     }
 }
 
@@ -190,6 +217,7 @@ class PollLoopHealthTracker @Inject constructor() {
             lastSuccessAtMs = nowMs,
             successCount = it.successCount + 1,
             failuresSinceLastSuccess = 0,
+            failureKindsThisOutage = emptySet(),
         )
     }
 
@@ -212,6 +240,8 @@ class PollLoopHealthTracker @Inject constructor() {
             lastFailureMessage = error.toString(),
             failureCount = it.failureCount + 1,
             failuresSinceLastSuccess = it.failuresSinceLastSuccess + 1,
+            failureKindsThisOutage = it.failureKindsThisOutage +
+                PollLoopHealth.failureKind(step, error),
         )
     }
 
@@ -232,6 +262,8 @@ class PollLoopHealthTracker @Inject constructor() {
             lastFailureMessage = error?.toString() ?: "loop body returned unexpectedly",
             failureCount = it.failureCount + 1,
             failuresSinceLastSuccess = it.failuresSinceLastSuccess + 1,
+            failureKindsThisOutage = it.failureKindsThisOutage +
+                PollLoopHealth.failureKind(step = null, error = error),
             restartCount = it.restartCount + 1,
         )
     }

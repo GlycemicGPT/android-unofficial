@@ -301,7 +301,7 @@ class PumpPollingOrchestrator @Inject constructor(
                 // A body that throws every time restarts forever on the backoff ceiling, so the
                 // report is damped the same way a repeating step failure is: opening edge and
                 // laddered reminders at ERROR, the rest on-device only.
-                if (before.opensFailureReport()) {
+                if (before.opensFailureReport(PollLoopHealth.failureKind(null, failure))) {
                     Timber.e(
                         "Poll loop %s stopped outside a guarded step (%s); restarting in %d ms [%s]",
                         loop.telemetryName,
@@ -366,11 +366,11 @@ class PumpPollingOrchestrator @Inject constructor(
             // from a parser or a Room write can embed a health value in its message, and the
             // beforeSend scrub only catches the unit-suffixed ones.
             //
-            // Only the opening edge of an outage and its laddered reminders go to ERROR: the loop
-            // keeps iterating through a failure by design, so an undamped report would ship one
-            // Sentry event per iteration for as long as the fault lasts. See
+            // Only a fault not yet seen in this outage, and the laddered reminders, go to ERROR:
+            // the loop keeps iterating through a failure by design, so an undamped report would
+            // ship one Sentry event per iteration for as long as the fault lasts. See
             // [PollLoopHealth.opensFailureReport]; the recovery WARN closes the outage either way.
-            if (before.opensFailureReport()) {
+            if (before.opensFailureReport(PollLoopHealth.failureKind(step, e))) {
                 Timber.e(
                     "Poll step failed (loop=%s step=%s cause=%s); continuing loop [%s]",
                     step.loop.telemetryName,

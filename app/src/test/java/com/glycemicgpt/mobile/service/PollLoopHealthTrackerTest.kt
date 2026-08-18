@@ -114,27 +114,74 @@ class PollLoopHealthTrackerTest {
         assertEquals(2L, recovered.failureCount)
     }
 
+    /** Records one CGM failure and answers whether the orchestrator would report it at ERROR. */
+    private fun reportsCgmFailure(error: Throwable, nowMs: Long): Boolean {
+        val before = tracker.recordStepFailure(PollStep.CGM, error, nowMs)
+        return before.opensFailureReport(PollLoopHealth.failureKind(PollStep.CGM, error))
+    }
+
     @Test
-    fun `failure reports open on the outage edge and then ladder off`() {
+    fun `a repeating failure reports on the outage edge and then ladders off`() {
         tracker.markRunning(PollLoop.FAST, nowMs = 1_000L)
 
         // Failure ordinals 1, 2, 4, 8, 16 are reportable; everything between them is a repeat.
         val reported = (1..20).filter { ordinal ->
-            val before = tracker.recordStepFailure(
-                PollStep.CGM,
-                RuntimeException("boom"),
-                nowMs = 1_000L + ordinal,
-            )
-            before.opensFailureReport()
+            reportsCgmFailure(RuntimeException("boom"), nowMs = 1_000L + ordinal)
         }
         assertEquals(listOf(1, 2, 4, 8, 16), reported)
 
-        // A clean iteration ends the outage, so the next failure opens a fresh report — the
-        // ladder must not carry a lifetime count over into the new outage.
+        // A clean iteration ends the outage, so the next failure opens a fresh report — neither
+        // the ladder nor the seen-faults set may carry over into the new outage.
         tracker.recordIterationSuccess(PollLoop.FAST, nowMs = 2_000L)
-        val afterRecovery =
-            tracker.recordStepFailure(PollStep.CGM, RuntimeException("boom"), nowMs = 2_100L)
-        assertTrue("a failure after a success opens a new report", afterRecovery.opensFailureReport())
+        assertEquals(emptySet<String>(), tracker.snapshot(PollLoop.FAST).failureKindsThisOutage)
+        assertTrue(
+            "a failure after a success opens a new report",
+            reportsCgmFailure(RuntimeException("boom"), nowMs = 2_100L),
+        )
+    }
+
+    @Test
+    fun `a fault not yet seen in the outage reports even while an old one is damped`() {
+        tracker.markRunning(PollLoop.SLOW, nowMs = 1_000L)
+        // A durable fault, run out to ordinal 20 so the failures below land at 21-24 — past the
+        // last ladder rung (16) and short of the next (32), so nothing here reports by coincidence.
+        (1..20).forEach {
+            tracker.recordStepFailure(PollStep.HISTORY_LOGS, RuntimeException("boom"), 1_000L + it)
+        }
+        val damped = tracker.recordStepFailure(PollStep.HISTORY_LOGS, RuntimeException("boom"), 2_000L)
+        assertFalse(
+            damped.opensFailureReport(
+                PollLoopHealth.failureKind(PollStep.HISTORY_LOGS, RuntimeException("boom")),
+            ),
+        )
+
+        // A second step starting to fail is news, and so is the first step failing a new way.
+        val otherStep = tracker.recordStepFailure(PollStep.BATTERY, RuntimeException("boom"), 2_100L)
+        assertTrue(
+            otherStep.opensFailureReport(
+                PollLoopHealth.failureKind(PollStep.BATTERY, RuntimeException("boom")),
+            ),
+        )
+        val otherCause =
+            tracker.recordStepFailure(PollStep.HISTORY_LOGS, IllegalStateException("bad row"), 2_200L)
+        assertTrue(
+            otherCause.opensFailureReport(
+                PollLoopHealth.failureKind(PollStep.HISTORY_LOGS, IllegalStateException("bad row")),
+            ),
+        )
+
+        // ...and a loop-body failure is its own kind, not one of the steps'.
+        val body = tracker.recordLoopRestart(PollLoop.SLOW, RuntimeException("escaped"), 2_300L)
+        assertTrue(body.opensFailureReport(PollLoopHealth.failureKind(null, RuntimeException("x"))))
+        assertEquals(
+            setOf(
+                "history_logs/RuntimeException",
+                "battery/RuntimeException",
+                "history_logs/IllegalStateException",
+                "loop_body/RuntimeException",
+            ),
+            tracker.snapshot(PollLoop.SLOW).failureKindsThisOutage,
+        )
     }
 
     @Test
@@ -142,11 +189,9 @@ class PollLoopHealthTrackerTest {
         tracker.markRunning(PollLoop.MEDIUM, nowMs = 1_000L)
 
         val reported = (1..8).filter { ordinal ->
-            tracker.recordLoopRestart(
-                PollLoop.MEDIUM,
-                RuntimeException("escaped"),
-                nowMs = 1_000L + ordinal,
-            ).opensFailureReport()
+            val error = RuntimeException("escaped")
+            tracker.recordLoopRestart(PollLoop.MEDIUM, error, nowMs = 1_000L + ordinal)
+                .opensFailureReport(PollLoopHealth.failureKind(null, error))
         }
         assertEquals(listOf(1, 2, 4, 8), reported)
         assertEquals(8L, tracker.snapshot(PollLoop.MEDIUM).restartCount)

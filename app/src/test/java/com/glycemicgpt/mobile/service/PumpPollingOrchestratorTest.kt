@@ -1088,6 +1088,30 @@ class PumpPollingOrchestratorTest {
     }
 
     @Test
+    fun `a second step failing mid-outage is reported even though the ladder is quiet`() = runTest {
+        val tree = RecordingTree()
+        Timber.plant(tree)
+        every { appSettingsStore.debugFaultPollStep } returns PollStep.IOB.telemetryName
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(SETTLE_TIME_MS)
+        repeat(2) { advanceTimeBy(FAST_CYCLE_MS) }
+        assertEquals(3L, loopHealth.snapshot(PollLoop.FAST).failuresSinceLastSuccess)
+
+        // A different step starts failing while the IoB outage is still running.
+        coEvery { syncEnqueuer.enqueueBasal(any()) } throws RuntimeException("sync queue full")
+        advanceTimeBy(FAST_CYCLE_MS)
+
+        // It lands at outage ordinal 5, so the ladder would have kept it silent; it is reported
+        // because nothing in this outage has failed this way before.
+        assertEquals(5L, loopHealth.snapshot(PollLoop.FAST).failuresSinceLastSuccess)
+        assertEquals(1, tree.at(Log.ERROR, "Poll step failed", "step=basal").size)
+        orchestrator.stop()
+    }
+
+    @Test
     fun `a loop that restarts forever reports on the same ladder`() = runTest {
         val tree = RecordingTree()
         Timber.plant(tree)
