@@ -3,6 +3,7 @@
 package com.glycemicgpt.mobile.service
 
 import android.app.Application
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -123,6 +124,26 @@ class ForegroundServiceStarterTest {
         ForegroundServiceStarter.promote(service, NOTIFICATION_ID, testNotification(), COMPONENT, reporter)
 
         assertFalse(reporter.isStartRejectedPending(COMPONENT))
+    }
+
+    @Test
+    fun `promote takes down the degraded notification the rejection left on screen`() {
+        // The user-visible half of the same recovery: the marker is for GLY-254, this is for the
+        // person holding the phone, who otherwise keeps a "monitoring not running" warning that
+        // stopped being true the moment this promotion succeeded (PR #44 review).
+        val component = FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION
+        reporter.recordForegroundStartRejected(component, IllegalStateException("budget exhausted"))
+        MonitoringDegradedNotifier.notify(appContext, component)
+        val manager = appContext.getSystemService(NotificationManager::class.java)
+        assertEquals(1, manager.activeNotifications.size)
+        val service = mockk<Service>(relaxed = true) {
+            every { getSystemService(NotificationManager::class.java) } returns manager
+        }
+
+        ForegroundServiceStarter.promote(service, NOTIFICATION_ID, testNotification(), component, reporter)
+
+        assertFalse(reporter.isStartRejectedPending(component))
+        assertEquals(0, manager.activeNotifications.size)
     }
 
     @Test

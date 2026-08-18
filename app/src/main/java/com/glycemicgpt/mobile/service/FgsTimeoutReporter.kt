@@ -102,7 +102,11 @@ class FgsTimeoutReporter @Inject constructor(
         prefs.edit()
             .putLong(keyLastStartRejectedAtMs(component), nowMs)
             .putBoolean(keyStartRejectedPending(component), true)
-            .apply()
+            // commit(), unlike recordTimeout's apply(): a rejection lands on the cold/background
+            // path where the process can be killed moments later, and this marker is the whole
+            // point of the record -- an async flush that never reaches disk loses it. Not a hot
+            // path, so the synchronous write costs nothing that matters (PR #44 review).
+            .commit()
         Timber.e(
             "%s component=%s exceptionType=%s reason=%s -- foreground start refused by the system",
             START_REJECTED_EVENT_TAG, component, error.javaClass.simpleName, reason.name,

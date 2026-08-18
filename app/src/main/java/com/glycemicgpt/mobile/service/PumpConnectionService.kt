@@ -245,6 +245,12 @@ class PumpConnectionService : Service() {
                 // this rejection just set -- otherwise GLY-254 would read a healthy component as
                 // still owing a resume (GLY-246 review F6 residual).
                 fgsTimeoutReporter.clearStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                // Same reasoning for the notification an earlier rejection may have posted: pump
+                // monitoring is running, so the "monitoring not running" warning is now a lie
+                // (PR #44 review).
+                runCatching {
+                    MonitoringDegradedNotifier.clear(this, FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                }
                 Timber.w(
                     "PumpConnectionService redundant re-promote rejected (%s); already running, continuing",
                     result.exceptionType,

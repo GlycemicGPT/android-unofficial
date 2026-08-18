@@ -173,7 +173,10 @@ class WatchFaceReceiveService : WearableListenerService() {
             )
         } catch (e: Exception) {
             Timber.e(e, "Unexpected failure promoting watch face receive to foreground")
-            FgsTimeoutReporter.recordForegroundStartRejected(
+            // Not recordForegroundStartRejected: everything this backstop catches came from the
+            // notification setup above, or is an exception type ForegroundServiceStarter does not
+            // classify -- neither is the platform refusing the start (PR #44 review).
+            FgsTimeoutReporter.recordForegroundSetupFailure(
                 FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
                 e,
             )

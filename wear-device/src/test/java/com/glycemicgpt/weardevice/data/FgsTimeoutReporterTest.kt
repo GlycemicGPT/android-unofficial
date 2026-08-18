@@ -148,6 +148,54 @@ class FgsTimeoutReporterTest {
     }
 
     @Test
+    fun `recordForegroundSetupFailure stays out of the rejection key space`() {
+        FgsTimeoutReporter.recordForegroundSetupFailure(
+            component = FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
+            error = IllegalArgumentException("bad notification channel"),
+            nowMs = 1_700_000_000_000L,
+        )
+
+        assertEquals(
+            1_700_000_000_000L,
+            FgsTimeoutReporter.lastSetupFailureAtMs(FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE),
+        )
+        assertEquals(
+            1,
+            FgsTimeoutReporter.setupFailureCount(FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE),
+        )
+        // The whole point: a channel-creation defect is not the system refusing the start, so it
+        // must leave the rejection counters -- the watch's only platform-pressure signal -- alone
+        // (PR #44 review).
+        assertEquals(
+            0,
+            FgsTimeoutReporter.startRejectedCount(FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE),
+        )
+        assertEquals(
+            0L,
+            FgsTimeoutReporter.lastStartRejectedAtMs(FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE),
+        )
+        assertEquals(
+            0,
+            FgsTimeoutReporter.timeoutCount(FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE),
+        )
+    }
+
+    @Test
+    fun `repeated setup failures accumulate their own count`() {
+        repeat(3) {
+            FgsTimeoutReporter.recordForegroundSetupFailure(
+                component = FgsTimeoutReporter.COMPONENT_WATCH_APK_RECEIVE,
+                error = IllegalArgumentException("bad notification channel"),
+            )
+        }
+
+        assertEquals(
+            3,
+            FgsTimeoutReporter.setupFailureCount(FgsTimeoutReporter.COMPONENT_WATCH_APK_RECEIVE),
+        )
+    }
+
+    @Test
     fun `an uninitialized store degrades to a log instead of throwing`() {
         FgsTimeoutReporter.setStoreForTest(null)
 

@@ -102,6 +102,50 @@ object FgsTimeoutReporter {
         )
     }
 
+    /**
+     * The promotion attempt for [component] failed for a reason that is *not* the system refusing
+     * it: a notification channel or builder throw before [ForegroundServiceStarter.promote] was
+     * even reached, or an exception type that helper does not classify. The receive services wrap
+     * their whole promotion block in a broad `catch (e: Exception)` so nothing escapes a
+     * `WearableListenerService` callback, and that backstop used to file everything it caught
+     * through [recordForegroundStartRejected].
+     *
+     * Its own key space and its own tag, because the two are different bugs with different fixes:
+     * an `IllegalArgumentException` out of `createNotificationChannel` is the app's own defect,
+     * while a rejection is the platform enforcing a limit. Folding app defects into
+     * [startRejectedCount] made the watch's only durable FGS signal read as platform pressure that
+     * was never there (PR #44 review).
+     */
+    fun recordForegroundSetupFailure(
+        component: String,
+        error: Throwable,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
+        val store = prefs
+        val count = setupFailureCount(component) + 1
+        if (store == null) {
+            Timber.w("FGS setup-failure store not initialized; %s failure not persisted", component)
+        } else {
+            store.edit()
+                .putLong(keyLastSetupFailureAtMs(component), nowMs)
+                .putInt(keySetupFailureCount(component), count)
+                .apply()
+        }
+        Timber.e(
+            "%s component=%s exceptionType=%s count=%d -- foreground promotion failed before the " +
+                "system could rule on it",
+            SETUP_FAILED_EVENT_TAG, component, error.javaClass.simpleName, count,
+        )
+    }
+
+    /** Wall-clock ms of the last recorded setup failure for [component], or 0 if none. */
+    fun lastSetupFailureAtMs(component: String): Long =
+        prefs?.getLong(keyLastSetupFailureAtMs(component), 0L) ?: 0L
+
+    /** How many times [component]'s promotion broke before the system ruled on it. */
+    fun setupFailureCount(component: String): Int =
+        prefs?.getInt(keySetupFailureCount(component), 0) ?: 0
+
     /** Wall-clock ms of the last recorded start rejection for [component], or 0 if none. */
     fun lastStartRejectedAtMs(component: String): Long =
         prefs?.getLong(keyLastStartRejectedAtMs(component), 0L) ?: 0L
@@ -137,9 +181,19 @@ object FgsTimeoutReporter {
 
     private fun keyStartRejectedCount(component: String) = "${component}_start_rejected_count"
 
+    private fun keyLastSetupFailureAtMs(component: String) = "${component}_setup_failure_at_ms"
+
+    private fun keySetupFailureCount(component: String) = "${component}_setup_failure_count"
+
     /**
      * Stable prefix on every start-rejection report, distinct from [EVENT_TAG] (which documents
      * the `dataSync` budget specifically -- GLY-246 review F7's phone-side fix, applied here too).
      */
     const val START_REJECTED_EVENT_TAG = "FGS_START_REJECTED"
+
+    /**
+     * Stable prefix on every setup-failure report. Kept apart from [START_REJECTED_EVENT_TAG] so a
+     * grep for platform rejections does not return the app's own notification-setup bugs.
+     */
+    const val SETUP_FAILED_EVENT_TAG = "FGS_START_SETUP_FAILED"
 }

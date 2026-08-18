@@ -185,6 +185,12 @@ class AlertStreamService : Service() {
                 // set -- otherwise GLY-254 would read a healthy component as still owing a resume
                 // (GLY-246 review F6 residual).
                 fgsTimeoutReporter.clearStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                // Same reasoning for the notification an earlier rejection may have posted: alert
+                // delivery is up, so the "monitoring not running" warning is now a lie (PR #44
+                // review).
+                runCatching {
+                    MonitoringDegradedNotifier.clear(this, FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                }
                 Timber.w(
                     "AlertStreamService redundant re-promote rejected (%s); stream already connected, continuing",
                     result.exceptionType,

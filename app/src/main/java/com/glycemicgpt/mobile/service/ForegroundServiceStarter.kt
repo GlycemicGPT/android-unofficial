@@ -77,8 +77,18 @@ object ForegroundServiceStarter {
                 service.startForeground(notificationId, notification)
             }
             // The component just promoted cleanly; whatever start-rejected marker it left behind
-            // (from this attempt or an earlier one) no longer describes reality (GLY-246 review F4).
-            reporter.clearStartRejectedPending(component)
+            // (from this attempt or an earlier one) no longer describes reality (GLY-246 review F4)
+            // -- and neither does the notification that told the user monitoring was off (PR #44
+            // review). Both are cleared under the same pending check so the success path costs one
+            // in-memory prefs read, not a binder call, on every promotion.
+            if (reporter.isStartRejectedPending(component)) {
+                reporter.clearStartRejectedPending(component)
+                // A degraded notification only exists for the components MonitoringDegradedNotifier
+                // knows; for the rest this cancels an id that was never posted. runCatching for the
+                // same reason the notify() call sites have it: nothing on the promotion path may
+                // throw out of here.
+                runCatching { MonitoringDegradedNotifier.clear(service, component) }
+            }
             ForegroundServiceStartResult.Started
         } catch (e: IllegalStateException) {
             reject(reporter, component, e)

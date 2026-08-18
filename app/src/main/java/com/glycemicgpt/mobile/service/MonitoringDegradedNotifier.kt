@@ -63,6 +63,22 @@ object MonitoringDegradedNotifier {
             .notify(notificationId(component), notification)
     }
 
+    /**
+     * Takes down a [notify] posted for [component] once that component is demonstrably running
+     * again (PR #44 review). Without this the warning outlives the problem: `setAutoCancel(true)`
+     * only dismisses on a tap, so a user who ignores the notification -- the common boot-path
+     * case -- kept a false "monitoring is off" claim on screen even after opening the app started
+     * the service, which is the exact remedy the text asks for.
+     *
+     * Unconditional `cancel`: cancelling an id that was never posted is a documented no-op, and
+     * [notificationId] derives an id no other notification in this app uses, so there is nothing
+     * to guard against.
+     */
+    fun clear(context: Context, component: String) {
+        context.getSystemService(NotificationManager::class.java)
+            .cancel(notificationId(component))
+    }
+
     private fun ensureChannel(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java)
         if (manager.getNotificationChannel(CHANNEL_ID) != null) return
