@@ -146,7 +146,11 @@ class DataSyncTimeoutCoverageTest {
 
     private fun dataSyncServices(module: Module): List<String> =
         serviceTags(module)
-            .filter { it.foregroundServiceType?.split("|")?.contains("dataSync") == true }
+            // Trim each token: `dataSync | connectedDevice` is a legal manifest value, and an
+            // untrimmed match would drop the service out of every assertion here without saying so.
+            .filter { tag ->
+                tag.foregroundServiceType?.split("|")?.any { it.trim() == "dataSync" } == true
+            }
             .map { it.className }
 
     private fun serviceTags(module: Module): List<ServiceTag> {

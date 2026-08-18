@@ -142,6 +142,22 @@ class AlertStreamServiceTimeoutTest {
         assertEquals(AlertStreamState.DISCONNECTED, stateHolder.state.value)
     }
 
+    @Test
+    fun `onDestroy without a timeout still drains the dispatcher`() {
+        occupyDispatcherWithAnUninterruptibleTask()
+
+        val elapsedMs = measureTimeMillis { service.onDestroy() }
+
+        // The negative half of the pair above: without this, setting stoppedByFgsTimeout
+        // unconditionally -- or deleting the awaitTermination call outright -- would leave the
+        // whole suite green while every normal stop dropped its in-flight requests on the floor.
+        assertTrue(
+            "onDestroy took only ${elapsedMs}ms on the normal stop path; the dispatcher drain " +
+                "is no longer running",
+            elapsedMs >= DRAIN_FLOOR_MS,
+        )
+    }
+
     /**
      * Hand the SSE dispatcher a task that swallows the interrupt `shutdownNow()` sends and keeps
      * holding its thread, the way a socket read blocked in native code does. Without this the
@@ -170,5 +186,8 @@ class AlertStreamServiceTimeoutTest {
     private companion object {
         const val START_ID = 7
         const val LATCH_TIMEOUT_SECONDS = 5L
+
+        /** `onDestroy` waits 3s for the dispatcher; leave slack for a loaded CI runner's clock. */
+        const val DRAIN_FLOOR_MS = 2_500L
     }
 }

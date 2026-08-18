@@ -182,10 +182,16 @@ class AlertStreamService : Service() {
      *
      * The system gives a few seconds to stop here; miss the window and it throws
      * `RemoteServiceException` and kills the process, taking PumpConnectionService and the pump
-     * connection down with it. So every step below is non-blocking and non-suspending:
-     * [shutDownStream] only cancels an EventSource and flips a StateFlow, and the OkHttp
-     * dispatcher drain in [onDestroy] is skipped via [stoppedByFgsTimeout]. Telemetry is
-     * recorded after `stopSelf()` so nothing at all sits between the callback and the stop.
+     * connection down with it. So the stop goes first and nothing that can wait sits in front of
+     * it: [shutDownStream] takes the same instance monitor as [connectToStream], which a reconnect
+     * coroutine can be holding on the IO dispatcher while it reads keystore-backed prefs. That
+     * hold is milliseconds in practice, but it is a wait, and the grace window is the one thing
+     * here worth spending nothing on. Teardown after `stopSelf()` still runs to completion before
+     * [onDestroy] -- both are main-thread, so onDestroy cannot be delivered until this returns.
+     *
+     * The rest of the path stays cheap for the same reason: [shutDownStream] only cancels an
+     * EventSource and flips a StateFlow, the OkHttp dispatcher drain in [onDestroy] is skipped via
+     * [stoppedByFgsTimeout], and telemetry is prefs-`apply()` plus a log line.
      *
      * Losing the stream flips [AlertStreamStateHolder] to DISCONNECTED, which is what arms the
      * on-device alert floor -- the user is told coverage degraded instead of silently losing it.
@@ -193,10 +199,10 @@ class AlertStreamService : Service() {
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     override fun onTimeout(startId: Int, fgsType: Int) {
         stoppedByFgsTimeout = true
-        shutDownStream()
-        reconnectJob?.cancel()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        shutDownStream()
+        reconnectJob?.cancel()
         fgsTimeoutReporter.recordTimeout(
             component = FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
             startId = startId,
