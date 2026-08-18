@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import com.glycemicgpt.mobile.data.local.AuthTokenStore
 import com.glycemicgpt.mobile.data.repository.AlertRepository
@@ -47,7 +48,10 @@ class WearChatRelayService : WearableListenerService() {
     @Inject lateinit var authTokenStore: AuthTokenStore
     @Inject lateinit var fgsTimeoutReporter: FgsTimeoutReporter
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Visible to the unit test so it can launch work after a timeout and prove the scope is still
+    // alive -- the difference between cancelChildren() and cancel() in onTimeout.
+    @VisibleForTesting
+    internal val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** Tracks active foreground work items. Only stop foreground when count hits 0. */
     private val activeWorkCount = AtomicInteger(0)

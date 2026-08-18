@@ -6,6 +6,7 @@ import android.app.Application
 import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import com.glycemicgpt.mobile.service.FgsTimeoutReporter
+import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -16,6 +17,8 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * The chat relay shares the app's `dataSync` budget with the alert stream, so Android 15 can
@@ -75,8 +78,18 @@ class WearChatRelayServiceTimeoutTest {
         service.onTimeout(START_ID, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
 
         // GMS keeps a WearableListenerService bound, so this instance can receive the next watch
-        // message. onTimeout cancels the scope's children rather than the scope, so a second
-        // timeout -- and any later work -- still runs instead of hitting a dead scope.
+        // message, and every reply the relay sends goes through serviceScope. onTimeout cancels
+        // the scope's children rather than the scope itself -- swap in serviceScope.cancel() and
+        // this launch never runs, leaving the relay permanently unable to answer the watch.
+        val ranAfterTimeout = CountDownLatch(1)
+        service.serviceScope.launch { ranAfterTimeout.countDown() }
+
+        assertTrue(
+            "work launched after a timeout never ran; onTimeout killed serviceScope",
+            ranAfterTimeout.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+
+        // And a redelivered timeout on the same instance is still handled.
         service.onTimeout(START_ID, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
 
         assertEquals(2, reporter.timeoutCount(FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY))
@@ -84,5 +97,6 @@ class WearChatRelayServiceTimeoutTest {
 
     private companion object {
         const val START_ID = 3
+        const val LATCH_TIMEOUT_SECONDS = 5L
     }
 }

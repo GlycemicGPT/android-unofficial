@@ -7,6 +7,7 @@ import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import com.glycemicgpt.mobile.data.remote.SimulateUnreachableInterceptor
 import io.mockk.mockk
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -17,6 +18,8 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.system.measureTimeMillis
 
 /**
@@ -38,6 +41,14 @@ class AlertStreamServiceTimeoutTest {
     private lateinit var service: AlertStreamService
     private lateinit var stateHolder: AlertStreamStateHolder
     private lateinit var reporter: FgsTimeoutReporter
+
+    /** Lets the parked dispatcher task exit once the test that needs it is done. */
+    private val releaseDispatcherTask = CountDownLatch(1)
+
+    @After
+    fun tearDown() {
+        releaseDispatcherTask.countDown()
+    }
 
     @Before
     fun setUp() {
@@ -115,6 +126,8 @@ class AlertStreamServiceTimeoutTest {
 
     @Test
     fun `onDestroy after a timeout completes without the dispatcher drain`() {
+        occupyDispatcherWithAnUninterruptibleTask()
+
         service.onTimeout(START_ID, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
 
         // The normal stop path waits up to 3s for the OkHttp dispatcher; on the timeout path
@@ -129,7 +142,33 @@ class AlertStreamServiceTimeoutTest {
         assertEquals(AlertStreamState.DISCONNECTED, stateHolder.state.value)
     }
 
+    /**
+     * Hand the SSE dispatcher a task that swallows the interrupt `shutdownNow()` sends and keeps
+     * holding its thread, the way a socket read blocked in native code does. Without this the
+     * dispatcher's executor is empty and terminates the instant it is shut down, so
+     * `awaitTermination` returns immediately whether or not the timeout path skips it -- the
+     * timing assertion would pin nothing.
+     */
+    private fun occupyDispatcherWithAnUninterruptibleTask() {
+        val running = CountDownLatch(1)
+        service.sseClient.dispatcher.executorService.execute {
+            running.countDown()
+            while (releaseDispatcherTask.count > 0L) {
+                try {
+                    releaseDispatcherTask.await()
+                } catch (_: InterruptedException) {
+                    // Deliberately swallowed -- that is what makes awaitTermination wait.
+                }
+            }
+        }
+        assertTrue(
+            "the dispatcher task never started",
+            running.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+    }
+
     private companion object {
         const val START_ID = 7
+        const val LATCH_TIMEOUT_SECONDS = 5L
     }
 }

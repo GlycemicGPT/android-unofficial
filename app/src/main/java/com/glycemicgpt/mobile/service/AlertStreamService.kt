@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.annotation.RequiresApi
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import com.glycemicgpt.mobile.BuildConfig
 import com.glycemicgpt.mobile.data.local.AppSettingsStore
@@ -98,8 +99,11 @@ class AlertStreamService : Service() {
     /** Generation counter to prevent stale callbacks from racing with new connections. */
     private val connectionGeneration = AtomicInteger(0)
 
-    // Reuse a single OkHttpClient across reconnects to avoid resource leaks
-    private val sseClient: OkHttpClient by lazy {
+    // Reuse a single OkHttpClient across reconnects to avoid resource leaks.
+    // Visible to the unit test so it can occupy the dispatcher and prove the timeout path really
+    // skips the drain in onDestroy -- an empty executor terminates instantly either way.
+    @VisibleForTesting
+    internal val sseClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             // The server heartbeats every 30s; 75s (2.5 intervals) tolerates one fully missed
