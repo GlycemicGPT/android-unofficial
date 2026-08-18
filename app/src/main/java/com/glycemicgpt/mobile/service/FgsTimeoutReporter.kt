@@ -188,9 +188,13 @@ class FgsTimeoutReporter @Inject constructor(
  * type restriction (Android 15), and the exhausted `dataSync` budget (Android 15) -- throw the
  * identical [ForegroundServiceStartNotAllowedException][java.lang.IllegalStateException] (an
  * `IllegalStateException` subclass), so the exception's class name alone cannot tell them apart;
- * only its message text can. Classification is deliberately best-effort text matching against the
- * platform's (undocumented, not API-contracted) message strings, not an exhaustive parse -- an
- * unrecognized message falls back to [OTHER] rather than guessing.
+ * only its message text can. Classification matches specific, narrow substrings pulled from real
+ * platform message text (e.g. `mAllowStartForeground`, the field name the background-start
+ * restriction's message names, captured from DropBox evidence in GLY-247) rather than generic
+ * phrases like "not allowed due to" or "background" that multiple distinct rejection reasons
+ * could plausibly share. A message that matches none of them falls back to [OTHER] instead of
+ * guessing -- for telemetry whose purpose is deciding which fix to ship, a confidently wrong
+ * label is worse than an honest "unknown".
  */
 enum class ForegroundStartRejectionReason {
     BUDGET_EXHAUSTED,
@@ -208,8 +212,7 @@ enum class ForegroundStartRejectionReason {
                 message.contains("time limit", ignoreCase = true) ||
                     message.contains("budget", ignoreCase = true) -> BUDGET_EXHAUSTED
                 message.contains("BOOT_COMPLETED", ignoreCase = true) -> BOOT_TYPE_RESTRICTION
-                message.contains("not allowed due to", ignoreCase = true) ||
-                    message.contains("background", ignoreCase = true) -> BACKGROUND_START_RESTRICTION
+                message.contains("mAllowStartForeground", ignoreCase = true) -> BACKGROUND_START_RESTRICTION
                 else -> OTHER
             }
         }

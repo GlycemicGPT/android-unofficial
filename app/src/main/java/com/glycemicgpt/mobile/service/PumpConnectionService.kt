@@ -73,10 +73,14 @@ class PumpConnectionService : Service() {
                 // monitoring is off -- most likely on the boot path, with no app UI open to
                 // eventually notice via AlertFloorStatusProvider. GLY-254 owns the full
                 // monitoring-health surface and will supersede this notification.
-                MonitoringDegradedNotifier.notify(
-                    context.applicationContext ?: context,
-                    FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
-                )
+                // runCatching: this runs on the boot path, where BootCompletedReceiver has no
+                // catch of its own left -- a throw here must not escape this companion.
+                runCatching {
+                    MonitoringDegradedNotifier.notify(
+                        context.applicationContext ?: context,
+                        FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                    )
+                }
             }
             return result
         }
@@ -236,7 +240,11 @@ class PumpConnectionService : Service() {
                 // A redundant re-promote (e.g. Settings reopened while already connected) was
                 // rejected -- the BLE link and polling are already live. Tearing this down would
                 // destroy a working connection over a rejection that only hit the *notification*
-                // re-promotion, not the work already underway (GLY-246 review F6).
+                // re-promotion, not the work already underway (GLY-246 review F6). The service is
+                // demonstrably running under foreground protection already, so clear the marker
+                // this rejection just set -- otherwise GLY-254 would read a healthy component as
+                // still owing a resume (GLY-246 review F6 residual).
+                fgsTimeoutReporter.clearStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
                 Timber.w(
                     "PumpConnectionService redundant re-promote rejected (%s); already running, continuing",
                     result.exceptionType,
@@ -252,7 +260,9 @@ class PumpConnectionService : Service() {
                 )
                 // GLY-254 owns the full monitoring-health surface and will supersede this
                 // notification.
-                MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                runCatching {
+                    MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                }
                 stopSelf(startId)
                 return START_NOT_STICKY
             }

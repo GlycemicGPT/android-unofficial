@@ -62,10 +62,14 @@ class AlertStreamService : Service() {
                 // delivery is off -- most likely on the boot path, with no app UI open to
                 // eventually notice. GLY-254 owns the full monitoring-health surface and will
                 // supersede this notification.
-                MonitoringDegradedNotifier.notify(
-                    context.applicationContext ?: context,
-                    FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
-                )
+                // runCatching: this runs on the boot path, where BootCompletedReceiver has no
+                // catch of its own left -- a throw here must not escape this companion.
+                runCatching {
+                    MonitoringDegradedNotifier.notify(
+                        context.applicationContext ?: context,
+                        FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+                    )
+                }
             }
             return result
         }
@@ -177,6 +181,10 @@ class AlertStreamService : Service() {
 
         if (result is ForegroundServiceStartResult.Rejected) {
             if (alreadyConnected) {
+                // The stream is demonstrably up already, so clear the marker this rejection just
+                // set -- otherwise GLY-254 would read a healthy component as still owing a resume
+                // (GLY-246 review F6 residual).
+                fgsTimeoutReporter.clearStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
                 Timber.w(
                     "AlertStreamService redundant re-promote rejected (%s); stream already connected, continuing",
                     result.exceptionType,

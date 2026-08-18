@@ -56,6 +56,7 @@ class AlertStreamServiceStartCommandTest {
 
     @Test
     fun `a rejected first promotion arms the alert floor and stops the service`() {
+        stateHolder.onStreamOpened()
         mockkObject(ForegroundServiceStarter)
         every {
             ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
@@ -76,6 +77,13 @@ class AlertStreamServiceStartCommandTest {
     fun `a rejected redundant re-promote survives while the stream is already connected`() {
         service.eventSource = mockk<EventSource>(relaxed = true)
         stateHolder.onStreamOpened()
+        // Simulate an earlier rejection's marker still being set, so the survive branch clearing
+        // it is actually pinned (GLY-246 review F6 residual, NEW-6): a healthy connected stream
+        // must not leave GLY-254 thinking it still owes a resume.
+        service.fgsTimeoutReporter.recordForegroundStartRejected(
+            FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+            IllegalStateException("missing permission"),
+        )
         mockkObject(ForegroundServiceStarter)
         every {
             ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
@@ -89,6 +97,10 @@ class AlertStreamServiceStartCommandTest {
             shadowOf(service).isStoppedBySelf,
         )
         assertEquals(AlertStreamState.CONNECTED, stateHolder.state.value)
+        assertFalse(
+            "a healthy connected component must not be left owing a resume it doesn't need",
+            service.fgsTimeoutReporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM),
+        )
     }
 
     private companion object {

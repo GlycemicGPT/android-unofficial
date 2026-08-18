@@ -39,12 +39,13 @@ object ForegroundServiceStarter {
     /** Companion-function call sites: `Context.startForegroundService`, before the service exists. */
     fun start(context: Context, intent: Intent, component: String): ForegroundServiceStartResult {
         // Lazy, not eager: the reporter's prefs handle must not open on the hot (success) path --
-        // see the class doc on FgsTimeoutReporter. A single lazy instance (rather than one built
-        // fresh per catch clause) also means `context.applicationContext`'s implicit null check
-        // resolves at most once per call, and from the try body rather than from inside a catch
-        // clause, so a hypothetical null cannot escape a running exception handler (GLY-246 review
-        // F9). The `?: context` fallback covers the documented-nullable edge Context.getApplicationContext()
-        // can technically return.
+        // see the class doc on FgsTimeoutReporter. `by lazy` still resolves on first access from
+        // inside whichever catch clause rejects the call (there is no other caller), but a single
+        // shared instance means that resolution happens at most once per call instead of once per
+        // catch clause (GLY-246 review F9). The `?: context` elvis on
+        // `context.applicationContext` means Kotlin emits no null-check intrinsic for the
+        // documented-nullable edge Context.getApplicationContext() can technically return -- there
+        // is no null to escape the handler in the first place.
         val reporter by lazy { FgsTimeoutReporter(context.applicationContext ?: context) }
         return try {
             context.startForegroundService(intent)

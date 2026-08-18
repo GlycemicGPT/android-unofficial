@@ -75,6 +75,13 @@ class PumpConnectionServiceStartCommandTest {
         service.started = true
         val pollingOrchestrator = mockk<PumpPollingOrchestrator>(relaxed = true)
         service.pollingOrchestrator = pollingOrchestrator
+        // Simulate an earlier rejection's marker still being set, so the survive branch clearing
+        // it is actually pinned (GLY-246 review F6 residual, NEW-6): a healthy running component
+        // must not leave GLY-254 thinking it still owes a resume.
+        service.fgsTimeoutReporter.recordForegroundStartRejected(
+            FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+            IllegalStateException("missing permission"),
+        )
         mockkObject(ForegroundServiceStarter)
         every {
             ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
@@ -88,6 +95,10 @@ class PumpConnectionServiceStartCommandTest {
             shadowOf(service).isStoppedBySelf,
         )
         verify(exactly = 0) { pollingOrchestrator.start(any()) }
+        assertFalse(
+            "a healthy running component must not be left owing a resume it doesn't need",
+            service.fgsTimeoutReporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION),
+        )
     }
 
     private companion object {

@@ -3,6 +3,7 @@
 package com.glycemicgpt.mobile.service
 
 import android.app.Application
+import android.app.NotificationManager
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import io.mockk.every
@@ -13,6 +14,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 /**
@@ -50,6 +52,14 @@ class ForegroundServiceCompanionStartTest {
             result,
         )
         assertTrue(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION))
+        // The service was never created, so this notification is the only thing that tells the
+        // user pump monitoring is off (GLY-246 review F2/NEW-4).
+        val appContext: Context = ApplicationProvider.getApplicationContext()
+        assertEquals(
+            1,
+            shadowOf(appContext.getSystemService(NotificationManager::class.java))
+                .allNotifications.size,
+        )
     }
 
     @Test
@@ -84,6 +94,14 @@ class ForegroundServiceCompanionStartTest {
             result,
         )
         assertTrue(reporter.isStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM))
+        // The service was never created, so this notification is the only thing that tells the
+        // user alert delivery is off (GLY-246 review F2/NEW-4).
+        val appContext: Context = ApplicationProvider.getApplicationContext()
+        assertEquals(
+            1,
+            shadowOf(appContext.getSystemService(NotificationManager::class.java))
+                .allNotifications.size,
+        )
     }
 
     @Test
