@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
 import com.glycemicgpt.weardevice.data.FgsTimeoutReporter
+import com.glycemicgpt.weardevice.data.ForegroundServiceStarter
 import com.glycemicgpt.weardevice.data.WearDataContract
 import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.Wearable
@@ -144,26 +145,28 @@ class WatchApkReceiveService : WearableListenerService() {
     }
 
     private fun tryPromoteToForeground() {
-        try {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
-                nm.createNotificationChannel(
-                    NotificationChannel(
-                        NOTIFICATION_CHANNEL_ID,
-                        "Watch App Update",
-                        NotificationManager.IMPORTANCE_LOW,
-                    ),
-                )
-            }
-            val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
-                .setContentTitle("Updating watch app")
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setOngoing(true)
-                .build()
-            startForeground(FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } catch (e: Exception) {
-            Timber.w(e, "Failed to promote to foreground, continuing without protection")
+        val nm = getSystemService(NotificationManager::class.java)
+        if (nm.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    NOTIFICATION_CHANNEL_ID,
+                    "Watch App Update",
+                    NotificationManager.IMPORTANCE_LOW,
+                ),
+            )
         }
+        val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("Updating watch app")
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setOngoing(true)
+            .build()
+        ForegroundServiceStarter.promote(
+            this,
+            FOREGROUND_ID,
+            notification,
+            FgsTimeoutReporter.COMPONENT_WATCH_APK_RECEIVE,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+        )
     }
 
     private suspend fun receiveAndInstallApk(channel: ChannelClient.Channel) {
