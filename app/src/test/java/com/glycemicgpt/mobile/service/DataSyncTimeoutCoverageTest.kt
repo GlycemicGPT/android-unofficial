@@ -11,8 +11,13 @@ import org.junit.Test
 import java.io.File
 
 /**
- * Drift guard for GLY-244: every `dataSync` foreground service the app declares -- on the phone
- * and on the watch -- must override `Service.onTimeout(int, int)`.
+ * Drift guard for the two ways a foreground service the app declares -- on the phone and on the
+ * watch -- can get the whole process killed by the platform:
+ *
+ * - GLY-244: every `dataSync` service must override `Service.onTimeout(int, int)`.
+ * - GLY-247: every service declaring any `foregroundServiceType` must override `onStartCommand`,
+ *   so a `startForegroundService` aimed at it reaches `startForeground` rather than being left on
+ *   the platform's stopwatch.
  *
  * Android 15 grants a single cumulative 6 h-per-24 h `dataSync` budget shared across all of
  * them, and a service that does not stop when the system calls `onTimeout` gets the whole
@@ -86,6 +91,48 @@ class DataSyncTimeoutCoverageTest {
     }
 
     @Test
+    fun `every declared foreground service answers a start command`() {
+        val checked = mutableListOf<String>()
+        val missing = mutableListOf<String>()
+
+        modules.forEach { module ->
+            foregroundServices(module).forEach { className ->
+                val source = requireNotNull(sourceFileFor(module, className)) {
+                    "${module.name} declares foreground service $className but no Kotlin source " +
+                        "was found under ${module.sourceRoot}. If it moved, update this guard."
+                }.readText()
+                checked += "${module.name}/$className"
+                if (!ON_START_COMMAND.containsMatchIn(source)) {
+                    missing += "${module.name}/$className"
+                }
+            }
+        }
+
+        assertTrue(
+            "No foreground services found in either manifest -- the guard stopped guarding.",
+            checked.isNotEmpty(),
+        )
+        // A service declaring a foregroundServiceType can be handed a startForegroundService --
+        // by the app itself, and for the exported ones (the Data Layer listeners) by anything on
+        // the device. The platform then holds a stopwatch that ends in
+        // ForegroundServiceDidNotStartInTimeException, killing the whole process, unless
+        // onStartCommand calls startForeground. Inheriting WearableListenerService's
+        // onStartCommand does not: that is how a start aimed at the chat relay killed the app ~30s
+        // later while GLY-247's background wake-up paths were being validated. (Answering with a
+        // bare stopSelf is not a substitute -- the platform crashes a service that stops while it
+        // still owes a promotion, which took ~1.5s in the same experiment.) The pump and
+        // alert-stream services promote and keep it; the Data Layer listeners promote and drop
+        // straight back out, since their work only ever arrives over the GMS binding -- so the
+        // guard checks that the override exists at all, and the per-service tests pin the answer.
+        assertTrue(
+            "These foreground services do not override onStartCommand(intent, flags, startId), " +
+                "so a startForegroundService aimed at them is never answered and the platform " +
+                "kills the process (GLY-247): $missing",
+            missing.isEmpty(),
+        )
+    }
+
+    @Test
     fun `the four services GLY-244 covers are still the dataSync ones`() {
         val declared = modules.flatMap { module -> dataSyncServices(module) }.toSet()
 
@@ -153,6 +200,10 @@ class DataSyncTimeoutCoverageTest {
             }
             .map { it.className }
 
+    /** Every service that declares any foregroundServiceType, not just the `dataSync` ones. */
+    private fun foregroundServices(module: Module): List<String> =
+        serviceTags(module).filter { it.foregroundServiceType != null }.map { it.className }
+
     private fun serviceTags(module: Module): List<ServiceTag> {
         val manifest = ContractFixtures.readRepoFile(module.manifestPath)
         return SERVICE_TAG.findAll(manifest).mapNotNull { match ->
@@ -177,6 +228,7 @@ class DataSyncTimeoutCoverageTest {
         val NAME_ATTR = Regex("android:name\\s*=\\s*\"([^\"]+)\"")
         val FGS_TYPE_ATTR = Regex("android:foregroundServiceType\\s*=\\s*\"([^\"]+)\"")
         val ON_TIMEOUT = Regex("override\\s+fun\\s+onTimeout\\s*\\(\\s*\\w+\\s*:\\s*Int\\s*,")
+        val ON_START_COMMAND = Regex("override\\s+fun\\s+onStartCommand\\s*\\(")
 
         val WATCH_PUSH_SERVICES = listOf(
             "com.glycemicgpt.weardevice.push.WatchFaceReceiveService",

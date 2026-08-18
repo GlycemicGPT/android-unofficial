@@ -3,6 +3,7 @@ package com.glycemicgpt.mobile.wear
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
@@ -58,6 +59,41 @@ class WearChatRelayService : WearableListenerService() {
     /** Tracks active foreground work items. Only stop foreground when count hits 0. */
     @VisibleForTesting
     internal val activeWorkCount = AtomicInteger(0)
+
+    /**
+     * A `startService`/`startForegroundService` delivery, which for this service always carries
+     * nothing to do: watch messages arrive over the GMS binding and land in [onMessageReceived],
+     * which does its own foreground promotion around the work it starts.
+     *
+     * It still has to be answered, and only one answer works. This service is exported (the Data
+     * Layer dispatches to it by intent filter) and declares `foregroundServiceType="dataSync"`, so
+     * anything on the device can aim a `startForegroundService` at it -- and the platform then
+     * requires a matching `startForeground`. Inheriting the default `onStartCommand` misses the
+     * 30 s deadline and the process dies with
+     * `ForegroundServiceDidNotStartInTimeException`; simply calling `stopSelf` instead is *also*
+     * fatal, and faster -- the platform crashes a service that stops while it still owes a
+     * promotion. Both were reproduced on an Android 16 emulator while validating this app's
+     * background wake-up paths, at 31 s and 1.5 s of process age respectively.
+     *
+     * So the obligation is discharged the only way that is not fatal: promote, then drop straight
+     * back out. [startWork]/[finishWork] already do exactly that pair, including the case that
+     * makes a naive promote-and-demote wrong -- a chat request in flight has promoted already, and
+     * the counter keeps this start command from demoting out from under it. A promotion the
+     * platform refuses is fine too: the attempt is what clears the obligation, which is why
+     * [ForegroundServiceStarter] catching the rejection leaves nothing owed.
+     *
+     * The cost is a silent notification posted and removed within a millisecond, and a sliver of
+     * the shared `dataSync` budget. `stopSelf` is safe once the promotion is discharged, and does
+     * not disturb a relay already under way: GMS holds a binding while a chat request is being
+     * handled, so the service is not destroyed.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        startWork()
+        finishWork()
+        stopSelf(startId)
+        return START_NOT_STICKY
+    }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
         when (messageEvent.path) {

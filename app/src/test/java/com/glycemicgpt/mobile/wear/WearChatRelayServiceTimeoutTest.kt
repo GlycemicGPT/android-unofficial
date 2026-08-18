@@ -3,6 +3,8 @@
 package com.glycemicgpt.mobile.wear
 
 import android.app.Application
+import android.app.Service
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import com.glycemicgpt.mobile.service.FgsTimeoutReporter
@@ -12,6 +14,7 @@ import com.glycemicgpt.mobile.service.ForegroundStartRejectionReason
 import io.mockk.every
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
+import io.mockk.verify
 import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -74,6 +77,53 @@ class WearChatRelayServiceTimeoutTest {
 
         assertFalse(shadowOf(service).isStoppedBySelf)
         assertEquals(1, service.activeWorkCount.get())
+    }
+
+    @Test
+    fun `a start command promotes and demotes so the platform gets its startForeground`() {
+        // The service is exported and declares foregroundServiceType="dataSync", so any
+        // startForegroundService aimed at it puts the process on the platform's stopwatch. Only a
+        // startForeground call takes it off: a start command that promotes nothing dies at ~30s
+        // with ForegroundServiceDidNotStartInTimeException, and one that answers with a bare
+        // stopSelf dies in ~1.5s -- both reproduced on an Android 16 emulator. Watch messages
+        // arrive over the GMS binding, so there is no work to hold the promotion for; it is taken
+        // and dropped in the same call.
+        mockkObject(ForegroundServiceStarter)
+        every {
+            ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
+        } returns ForegroundServiceStartResult.Started
+
+        val returned = service.onStartCommand(Intent(), 0, START_ID)
+
+        verify(exactly = 1) {
+            ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
+        }
+        assertTrue(shadowOf(service).isForegroundStopped)
+        assertTrue(shadowOf(service).isStoppedBySelf)
+        assertEquals(Service.START_NOT_STICKY, returned)
+        // The counter is left where it was found, so the next real chat request still promotes.
+        assertEquals(0, service.activeWorkCount.get())
+    }
+
+    @Test
+    fun `a start command landing mid-request leaves the in-flight relay promoted`() {
+        // GMS keeps the service bound while a chat request is being handled, so stopSelf does not
+        // destroy it -- but a start command that promoted and demoted unconditionally would drop
+        // the foreground state out from under the request. The work counter is what prevents that:
+        // the relay is already promoted, so this start neither re-promotes nor demotes.
+        mockkObject(ForegroundServiceStarter)
+        every {
+            ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
+        } returns ForegroundServiceStartResult.Started
+        service.startWork()
+
+        service.onStartCommand(Intent(), 0, START_ID)
+
+        assertEquals(1, service.activeWorkCount.get())
+        assertFalse(shadowOf(service).isForegroundStopped)
+        verify(exactly = 1) {
+            ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
+        }
     }
 
     @Test

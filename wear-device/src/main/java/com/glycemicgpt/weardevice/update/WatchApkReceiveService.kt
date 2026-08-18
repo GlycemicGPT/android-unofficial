@@ -75,6 +75,41 @@ class WatchApkReceiveService : WearableListenerService() {
     }
 
     /**
+     * A `startService`/`startForegroundService` delivery, which for this service always carries
+     * nothing to do: APK pushes arrive over the GMS channel and land in [onChannelOpened], which
+     * does its own foreground promotion around the transfer it starts.
+     *
+     * It still has to be answered, and only one answer works. This service is exported (the Data
+     * Layer dispatches to it by intent filter) and declares `foregroundServiceType="dataSync"`, so
+     * anything on the watch can aim a `startForegroundService` at it -- and the platform then
+     * requires a matching `startForeground`. Inheriting the default `onStartCommand` misses the
+     * 30 s deadline and the process dies with `ForegroundServiceDidNotStartInTimeException`;
+     * simply calling `stopSelf` instead is *also* fatal, and faster -- the platform crashes a
+     * service that stops while it still owes a promotion. Both were reproduced on the phone side's
+     * twin of this service (`WearChatRelayService`) on an Android 16 emulator.
+     *
+     * So the obligation is discharged the only way that is not fatal: promote, then drop straight
+     * back out, under the same [foregroundLock]/[activePushCount] bookkeeping a real push uses --
+     * which is what keeps this start command from demoting out from under a transfer already
+     * under way. `stopSelf` is safe once the promotion is discharged, and does not destroy the
+     * service while GMS holds its binding.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        synchronized(foregroundLock) {
+            if (activePushCount.getAndIncrement() == 0) {
+                tryPromoteToForeground()
+            }
+            if (activePushCount.decrementAndGet() <= 0) {
+                activePushCount.set(0)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+        }
+        stopSelf(startId)
+        return START_NOT_STICKY
+    }
+
+    /**
      * The app's cumulative `dataSync` foreground-service budget (6 h per 24 h on Wear OS 5+) is
      * spent while an APK transfer was in flight. Stop within the system's few-second window or
      * it throws `RemoteServiceException` and kills the watch process.

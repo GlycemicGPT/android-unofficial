@@ -3,6 +3,7 @@ package com.glycemicgpt.weardevice.push
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
@@ -68,6 +69,41 @@ class WatchFaceReceiveService : WearableListenerService() {
         // Open the timeout store now so [onTimeout], which has only seconds to run, never has
         // to read a prefs file from disk.
         FgsTimeoutReporter.init(applicationContext)
+    }
+
+    /**
+     * A `startService`/`startForegroundService` delivery, which for this service always carries
+     * nothing to do: pushes arrive over the GMS channel and land in [onChannelOpened], which does
+     * its own foreground promotion around the transfer it starts.
+     *
+     * It still has to be answered, and only one answer works. This service is exported (the Data
+     * Layer dispatches to it by intent filter) and declares `foregroundServiceType="dataSync"`, so
+     * anything on the watch can aim a `startForegroundService` at it -- and the platform then
+     * requires a matching `startForeground`. Inheriting the default `onStartCommand` misses the
+     * 30 s deadline and the process dies with `ForegroundServiceDidNotStartInTimeException`;
+     * simply calling `stopSelf` instead is *also* fatal, and faster -- the platform crashes a
+     * service that stops while it still owes a promotion. Both were reproduced on the phone side's
+     * twin of this service (`WearChatRelayService`) on an Android 16 emulator.
+     *
+     * So the obligation is discharged the only way that is not fatal: promote, then drop straight
+     * back out, under the same [foregroundLock]/[activePushCount] bookkeeping a real push uses --
+     * which is what keeps this start command from demoting out from under a transfer already
+     * under way. `stopSelf` is safe once the promotion is discharged, and does not destroy the
+     * service while GMS holds its binding.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        synchronized(foregroundLock) {
+            if (activePushCount.getAndIncrement() == 0) {
+                tryPromoteToForeground()
+            }
+            if (activePushCount.decrementAndGet() <= 0) {
+                activePushCount.set(0)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+        }
+        stopSelf(startId)
+        return START_NOT_STICKY
     }
 
     /**
