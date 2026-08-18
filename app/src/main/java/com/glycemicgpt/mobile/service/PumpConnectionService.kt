@@ -62,7 +62,11 @@ class PumpConnectionService : Service() {
         private const val RECONNECT_WAKE_LOCK_TIMEOUT_MS = 2L * 60 * 1000 // 2 minutes
 
         fun start(context: Context) {
-            context.startForegroundService(Intent(context, PumpConnectionService::class.java))
+            ForegroundServiceStarter.start(
+                context,
+                Intent(context, PumpConnectionService::class.java),
+                FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+            )
         }
 
         fun stop(context: Context) {
@@ -87,6 +91,9 @@ class PumpConnectionService : Service() {
 
     @Inject
     lateinit var authTokenStore: AuthTokenStore
+
+    @Inject
+    lateinit var fgsTimeoutReporter: FgsTimeoutReporter
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -201,7 +208,24 @@ class PumpConnectionService : Service() {
         // Rebuild from the cached status, never the default: a redundant start during an outage
         // must not replace the honest "NOT watching" text with all-is-well copy.
         val notification = buildNotification(lastFloorStatus)
-        startForeground(NOTIFICATION_ID, notification)
+        val result = ForegroundServiceStarter.promote(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+            fgsTimeoutReporter,
+        )
+        if (result is ForegroundServiceStartResult.Rejected) {
+            // The BLE link and polling only matter behind a live foreground promotion -- without
+            // one the system can kill this process at any time. Stop cleanly instead of running
+            // unprotected; the rejection is already durably recorded for GLY-254 to resume from.
+            Timber.w(
+                "PumpConnectionService foreground start rejected (%s); stopping",
+                result.exceptionType,
+            )
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
 
         // Guard: only start orchestrators and watchers once per service lifecycle.
         // onStartCommand may be called multiple times (re-delivery, duplicate starts).

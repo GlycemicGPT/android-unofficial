@@ -69,17 +69,33 @@ class FgsTimeoutReporter @Inject constructor(
     }
 
     /**
-     * The system refused to promote [component] to a `dataSync` foreground service, which on
-     * Android 15 is what happens to every start attempt after the budget is spent. Reported at
-     * error level for the same reason as a timeout: it means the app is running without the
-     * protection it thinks it has.
+     * The system refused to start or promote [component] to a foreground service -- a background
+     * start restriction (API 26+), the exhausted `dataSync` budget (Android 15), or a missing
+     * permission. Reported at error level for the same reason as a timeout: it means the app is
+     * running without the protection it thinks it has. Sets the same resume-pending marker
+     * [recordTimeout] does, so GLY-254's reconciler has one place to look for either kind of
+     * interrupted start.
+     *
+     * `Timber.e` takes the exception class only, not the throwable -- same discipline as
+     * [com.glycemicgpt.mobile.service.PumpPollingOrchestrator]'s exception logging (GLY-249): an
+     * ERROR-level Timber call is promoted to a real Sentry event, and the message can carry
+     * data (e.g. permission details) that does not belong in a telemetry event. The full
+     * throwable still goes to DEBUG for local troubleshooting.
      */
-    fun recordForegroundStartRejected(component: String, error: Throwable) {
+    fun recordForegroundStartRejected(
+        component: String,
+        error: Throwable,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
+        prefs.edit()
+            .putLong(keyLastTimeoutAtMs(component), nowMs)
+            .putBoolean(keyResumePending(component), true)
+            .apply()
         Timber.e(
-            error,
-            "%s_START_REJECTED component=%s -- dataSync foreground start refused by the system",
-            EVENT_TAG, component,
+            "%s_START_REJECTED component=%s reason=%s -- foreground start refused by the system",
+            EVENT_TAG, component, error.javaClass.simpleName,
         )
+        Timber.d(error, "%s_START_REJECTED detail for component=%s", EVENT_TAG, component)
     }
 
     /** Wall-clock ms of the last recorded timeout for [component], or 0 if it never timed out. */
@@ -117,6 +133,7 @@ class FgsTimeoutReporter @Inject constructor(
 
         const val COMPONENT_ALERT_STREAM = "alert_stream"
         const val COMPONENT_WEAR_CHAT_RELAY = "wear_chat_relay"
+        const val COMPONENT_PUMP_CONNECTION = "pump_connection"
 
         private const val PREFS_NAME = "fgs_timeout"
     }

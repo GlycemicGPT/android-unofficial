@@ -52,7 +52,11 @@ class AlertStreamService : Service() {
         private const val MAX_BACKOFF_MS = 60_000L
         private const val STABLE_CONNECTION_MS = 10_000L // Must be open 10s before resetting backoff
         fun start(context: Context) {
-            context.startForegroundService(Intent(context, AlertStreamService::class.java))
+            ForegroundServiceStarter.start(
+                context,
+                Intent(context, AlertStreamService::class.java),
+                FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+            )
         }
 
         fun stop(context: Context) {
@@ -141,19 +145,20 @@ class AlertStreamService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        try {
-            startForeground(NOTIFICATION_ID, buildNotification())
-        } catch (e: IllegalStateException) {
+        val result = ForegroundServiceStarter.promote(
+            this,
+            NOTIFICATION_ID,
+            buildNotification(),
+            FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+            fgsTimeoutReporter,
+        )
+        if (result is ForegroundServiceStartResult.Rejected) {
             // Android 15 refuses a dataSync foreground start once the 24 h budget is spent
             // (ForegroundServiceStartNotAllowedException, an IllegalStateException). Letting it
             // escape kills the whole process -- taking PumpConnectionService and the pump link
             // with it, which is the exact failure this service's onTimeout exists to prevent.
             // Stop instead; the state holder already reports the honest degraded state, so the
             // on-device alert floor arms rather than the user silently losing coverage.
-            fgsTimeoutReporter.recordForegroundStartRejected(
-                FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
-                e,
-            )
             alertStreamStateHolder.onStreamStopped()
             stopSelf(startId)
             return START_NOT_STICKY
