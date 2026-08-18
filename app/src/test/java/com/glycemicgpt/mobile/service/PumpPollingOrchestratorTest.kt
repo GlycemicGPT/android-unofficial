@@ -9,6 +9,7 @@ import com.glycemicgpt.mobile.data.repository.SyncQueueEnqueuer
 import com.glycemicgpt.mobile.domain.alerting.AlertTypes
 import com.glycemicgpt.mobile.domain.model.BasalReading
 import com.glycemicgpt.mobile.domain.model.BatteryStatus
+import com.glycemicgpt.mobile.domain.model.BolusEvent
 import com.glycemicgpt.mobile.domain.model.CgmReading
 import com.glycemicgpt.mobile.domain.model.CgmTrend
 import com.glycemicgpt.mobile.domain.model.ConnectionState
@@ -25,12 +26,14 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -131,7 +134,19 @@ class PumpPollingOrchestratorTest {
     private val FAST_CYCLE_MS = PumpPollingOrchestrator.INTERVAL_FAST_MS +
         PumpPollingOrchestrator.REQUEST_STAGGER_MS * 2
 
-    private fun createOrchestrator() = PumpPollingOrchestrator(pumpDriver, repository, syncEnqueuer, rawHistoryLogDao, wearDataSender, glucoseRangeStore, safetyLimitsStore, historyLogParser, appSettingsStore, alertFloor)
+    /** Real tracker, not a mock: the heartbeat assertions below are about the state transitions it
+     *  actually performs, and GLY-254's watchdog will read exactly this. */
+    private val loopHealth = PollLoopHealthTracker()
+
+    /** One further medium/slow-loop cycle in virtual time: the interval plus the staggers the
+     *  loop spends inside an iteration, plus a margin (`advanceTimeBy` does not run a task
+     *  scheduled exactly at the boundary). */
+    private val MEDIUM_CYCLE_MS = PumpPollingOrchestrator.INTERVAL_MEDIUM_MS + 100
+    private val SLOW_CYCLE_MS = PumpPollingOrchestrator.INTERVAL_SLOW_MS +
+        PumpPollingOrchestrator.REQUEST_STAGGER_MS * 4 +
+        PumpPollingOrchestrator.BACKFILL_BATCH_STAGGER_MS * 2 + 100
+
+    private fun createOrchestrator() = PumpPollingOrchestrator(pumpDriver, repository, syncEnqueuer, rawHistoryLogDao, wearDataSender, glucoseRangeStore, safetyLimitsStore, historyLogParser, appSettingsStore, alertFloor, loopHealth)
 
     @Test
     fun `does not poll when disconnected`() = runTest {
@@ -723,6 +738,358 @@ class PumpPollingOrchestratorTest {
         verify(atLeast = 1) { historyLogParser.extractCgmFromHistoryLogs(fakeRecords, any()) }
         verify(atLeast = 1) { historyLogParser.extractBolusesFromHistoryLogs(fakeRecords, any()) }
         verify(atLeast = 1) { historyLogParser.extractBasalFromHistoryLogs(fakeRecords, any()) }
+        orchestrator.stop()
+    }
+
+    // -- GLY-249: fault injection, liveness, and clean cancellation -------------
+    // The loops run under the service's SupervisorJob, so before this story a single throw from
+    // Room, a parser, or the sync queue killed one loop silently and permanently while the
+    // notification still claimed "connected". Each test below injects that throw at a real
+    // collaborator and asserts the loop is still polling on the NEXT iteration.
+
+    private val historyRecords = listOf(
+        HistoryLogRecord(
+            sequenceNumber = 100,
+            rawBytesB64 = "dGVzdA==",
+            eventTypeId = 399,
+            pumpTimeSeconds = 572_000_000L,
+        ),
+    )
+
+    /** Makes the slow loop's history step do real work (fetch → persist → parse) so the DAO,
+     *  parser and enqueuer on that path are actually reached. */
+    private fun stubHistoryBackfill() {
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns Result.success(historyRecords)
+        coEvery { pumpDriver.getFullHistoryLogs(any()) } returns Result.success(historyRecords)
+        every { historyLogParser.extractCgmFromHistoryLogs(any(), any()) } returns emptyList()
+        every { historyLogParser.extractBolusesFromHistoryLogs(any(), any()) } returns emptyList()
+        every { historyLogParser.extractBasalFromHistoryLogs(any(), any()) } returns emptyList()
+    }
+
+    /** Makes the medium loop's bolus step do real work, so its save + enqueue are reached. */
+    private fun stubBolusHistory() {
+        coEvery { pumpDriver.getBolusHistory(any(), any()) } returns Result.success(
+            listOf(
+                BolusEvent(
+                    units = 1.5f,
+                    isAutomated = false,
+                    isCorrection = false,
+                    timestamp = Instant.now(),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `fast loop survives a throwing repository write and keeps polling`() = runTest {
+        coEvery { repository.saveIoB(any()) } throws RuntimeException("Room write failed")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(SETTLE_TIME_MS)
+        coVerify(exactly = 1) { pumpDriver.getIoB() }
+        // The throw costs the IoB step only: the rest of the same iteration still ran.
+        coVerify(exactly = 1) { pumpDriver.getBasalRate() }
+        coVerify(exactly = 1) { pumpDriver.getCgmStatus() }
+
+        advanceTimeBy(FAST_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getIoB() }
+        assertEquals(PollStep.IOB, loopHealth.snapshot(PollLoop.FAST).lastFailureStep)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `fast loop survives a throwing sync enqueuer and keeps polling`() = runTest {
+        coEvery { syncEnqueuer.enqueueBasal(any()) } throws RuntimeException("sync queue full")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(SETTLE_TIME_MS)
+        coVerify(exactly = 1) { pumpDriver.getCgmStatus() }
+
+        advanceTimeBy(FAST_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getBasalRate() }
+        assertEquals(PollStep.BASAL, loopHealth.snapshot(PollLoop.FAST).lastFailureStep)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `medium loop survives a throwing sync enqueuer and keeps polling`() = runTest {
+        stubBolusHistory()
+        coEvery { syncEnqueuer.enqueueBoluses(any()) } throws RuntimeException("sync queue full")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        coVerify(exactly = 1) { pumpDriver.getBolusHistory(any(), any()) }
+
+        advanceTimeBy(MEDIUM_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getBolusHistory(any(), any()) }
+        assertEquals(PollStep.BOLUS_HISTORY, loopHealth.snapshot(PollLoop.MEDIUM).lastFailureStep)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `medium loop survives a throwing repository write and keeps polling`() = runTest {
+        stubBolusHistory()
+        coEvery { repository.saveBoluses(any()) } throws RuntimeException("Room write failed")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        advanceTimeBy(MEDIUM_CYCLE_MS)
+
+        coVerify(exactly = 2) { pumpDriver.getBolusHistory(any(), any()) }
+        assertNull(loopHealth.snapshot(PollLoop.MEDIUM).lastSuccessAtMs)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `slow loop survives a throwing history DAO and keeps polling`() = runTest {
+        stubHistoryBackfill()
+        coEvery { rawHistoryLogDao.insertAll(any()) } throws RuntimeException("SQLCipher error")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        coVerify(exactly = 1) { rawHistoryLogDao.insertAll(any()) }
+        // Steps after the failing one still run in the same iteration.
+        coVerify(exactly = 1) { pumpDriver.getPumpHardwareInfo() }
+
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getBatteryStatus() }
+        coVerify(exactly = 2) { rawHistoryLogDao.insertAll(any()) }
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `slow loop survives a throwing history parser and keeps polling`() = runTest {
+        stubHistoryBackfill()
+        // A pump that keeps producing records: every fetch answers past the sequence it was
+        // asked from, so the parser is reached again on the next cycle rather than short
+        // -circuiting on the "sequence not advancing" guard.
+        coEvery { pumpDriver.getHistoryLogs(any()) } coAnswers {
+            Result.success(listOf(historyRecords.first().copy(sequenceNumber = firstArg<Int>() + 1)))
+        }
+        every {
+            historyLogParser.extractCgmFromHistoryLogs(any(), any())
+        } throws IllegalArgumentException("unparseable record")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        verify(exactly = 1) { historyLogParser.extractCgmFromHistoryLogs(any(), any()) }
+
+        advanceTimeBy(SLOW_CYCLE_MS)
+        verify(exactly = 2) { historyLogParser.extractCgmFromHistoryLogs(any(), any()) }
+        coVerify(exactly = 2) { pumpDriver.getReservoirLevel() }
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `slow loop survives a throwing sync enqueuer and keeps polling`() = runTest {
+        coEvery { syncEnqueuer.enqueueBattery(any()) } throws RuntimeException("sync queue full")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        // Battery threw; reservoir and the rest of the iteration are untouched.
+        coVerify(exactly = 1) { repository.saveReservoir(any()) }
+
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getBatteryStatus() }
+        assertEquals(PollStep.BATTERY, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `every loop publishes a last-successful-iteration heartbeat`() = runTest {
+        val orchestrator = createOrchestrator()
+        PollLoop.entries.forEach { assertNull(loopHealth.snapshot(it).lastSuccessAtMs) }
+
+        orchestrator.start(this)
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        PollLoop.entries.forEach { loop ->
+            val health = loopHealth.snapshot(loop)
+            assertTrue("$loop should be running", health.running)
+            assertNotNull("$loop should have a heartbeat", health.lastSuccessAtMs)
+            assertTrue("$loop should have completed an iteration", health.successCount >= 1)
+        }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `heartbeat freezes while a step keeps failing and resumes once it recovers`() = runTest {
+        // The debug fault toggle is the same seam the on-device harness uses.
+        every { appSettingsStore.debugFaultPollStep } returns PollStep.IOB.telemetryName
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(SETTLE_TIME_MS)
+        advanceTimeBy(FAST_CYCLE_MS)
+
+        // Polling continues, but a loop that never completes an iteration must not claim health.
+        coVerify(atLeast = 2) { pumpDriver.getBasalRate() }
+        assertNull(loopHealth.snapshot(PollLoop.FAST).lastSuccessAtMs)
+        assertTrue(loopHealth.snapshot(PollLoop.FAST).failureCount >= 2)
+        // The current-outage counter is what makes the recovery reportable to telemetry.
+        assertTrue(loopHealth.snapshot(PollLoop.FAST).failuresSinceLastSuccess >= 2)
+
+        every { appSettingsStore.debugFaultPollStep } returns ""
+        advanceTimeBy(FAST_CYCLE_MS)
+        val recovered = loopHealth.snapshot(PollLoop.FAST)
+        assertNotNull(recovered.lastSuccessAtMs)
+        assertEquals(0L, recovered.failuresSinceLastSuccess)
+        assertTrue("lifetime failures survive the recovery", recovered.failureCount >= 2)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a throwing history anchor read does not stop polling and is retried`() = runTest {
+        stubHistoryBackfill()
+        // The connection watcher reads the resume anchor before it observes anything. Unguarded,
+        // this throw used to kill the watcher outright: no loops, no polling, no telemetry.
+        coEvery { rawHistoryLogDao.getMaxSequenceNumber() } throws RuntimeException("SQLCipher")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerify(atLeast = 1) { pumpDriver.getIoB() }
+        PollLoop.entries.forEach { assertTrue("$it should run", loopHealth.snapshot(it).running) }
+        // The slow loop retried the anchor, reported the retry's failure against its own step, and
+        // did NOT backfill from a bogus anchor of 0 (which would re-read the pump's full history).
+        coVerify(exactly = 0) { pumpDriver.getHistoryLogs(any()) }
+        coVerify(exactly = 0) { pumpDriver.getFullHistoryLogs(any()) }
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        // The rest of the slow iteration is untouched by it.
+        coVerify(atLeast = 1) { pumpDriver.getBatteryStatus() }
+
+        // Once Room answers again, the backfill resumes from the stored anchor.
+        coEvery { rawHistoryLogDao.getMaxSequenceNumber() } returns 4_200
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(atLeast = 1) { pumpDriver.getHistoryLogs(4_200) }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a loop that throws outside a step guard is restarted with backoff`() = runTest {
+        every { appSettingsStore.debugFaultPollStep } returns PollLoop.FAST.loopFaultKey
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(10_000)
+
+        // The body never reaches a step, but the loop job is alive and being relaunched.
+        coVerify(exactly = 0) { pumpDriver.getIoB() }
+        val restarted = loopHealth.snapshot(PollLoop.FAST)
+        assertTrue("expected restarts, got ${restarted.restartCount}", restarted.restartCount >= 3)
+        assertTrue(restarted.running)
+        // Backoff, not a hot loop: unbounded retries would be far more than one per second.
+        assertTrue("restarts should back off", restarted.restartCount <= 10)
+        // The other loops are untouched by the fast loop's failure.
+        assertEquals(0L, loopHealth.snapshot(PollLoop.SLOW).restartCount)
+
+        every { appSettingsStore.debugFaultPollStep } returns ""
+        advanceTimeBy(60_000)
+        coVerify(atLeast = 1) { pumpDriver.getIoB() }
+        assertNotNull(loopHealth.snapshot(PollLoop.FAST).lastSuccessAtMs)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a CancellationException from a step is not swallowed - the loop dies, others live`() =
+        runTest {
+            coEvery { repository.saveIoB(any()) } throws CancellationException("scope cancelled")
+            val orchestrator = createOrchestrator()
+            orchestrator.start(this)
+
+            connectionStateFlow.value = ConnectionState.CONNECTED
+            advanceTimeBy(ALL_SETTLE_MS)
+
+            // Cancellation propagates through runStep and the supervisor: the fast loop is gone
+            // (no restart, no second poll), and its liveness says so rather than going stale
+            // while claiming to run.
+            coVerify(exactly = 1) { pumpDriver.getIoB() }
+            val fast = loopHealth.snapshot(PollLoop.FAST)
+            assertFalse("cancelled loop must not report running", fast.running)
+            assertEquals(0L, fast.restartCount)
+            // Sibling loops are unaffected — they share only a SupervisorJob.
+            assertTrue(loopHealth.snapshot(PollLoop.SLOW).running)
+            coVerify(atLeast = 1) { pumpDriver.getBatteryStatus() }
+            orchestrator.stop()
+        }
+
+    @Test
+    fun `disconnect and stop cancel every loop cleanly - no leaked loops`() = runTest {
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        PollLoop.entries.forEach { assertTrue("$it should run", loopHealth.snapshot(it).running) }
+
+        connectionStateFlow.value = ConnectionState.DISCONNECTED
+        advanceTimeBy(1000)
+        PollLoop.entries.forEach {
+            assertFalse("$it should stop on disconnect", loopHealth.snapshot(it).running)
+        }
+
+        // ...and again through the onDestroy path, from a running state.
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        assertTrue(loopHealth.snapshot(PollLoop.FAST).running)
+        val pollsBeforeStop = loopHealth.snapshot(PollLoop.FAST).successCount
+
+        orchestrator.stop()
+        advanceTimeBy(ALL_SETTLE_MS)
+        PollLoop.entries.forEach {
+            assertFalse("$it should stop on onDestroy", loopHealth.snapshot(it).running)
+        }
+        assertEquals(pollsBeforeStop, loopHealth.snapshot(PollLoop.FAST).successCount)
+    }
+
+    @Test
+    fun `restarting a loop resets its session liveness`() = runTest {
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        assertTrue(loopHealth.snapshot(PollLoop.FAST).successCount >= 1)
+
+        // A reconnect starts fresh loop jobs; carrying the old heartbeat over would let a
+        // watchdog call a loop that has not yet done anything healthy.
+        connectionStateFlow.value = ConnectionState.DISCONNECTED
+        advanceTimeBy(1000)
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(1)
+
+        val fresh = loopHealth.snapshot(PollLoop.FAST)
+        assertEquals(0L, fresh.successCount)
+        assertNull(fresh.lastSuccessAtMs)
+        assertNotNull(fresh.startedAtMs)
+
+        // The relaunched loop polls and reports live. (The outgoing job's teardown racing the
+        // replacement's start is a scheduling order this virtual-time test cannot force; the
+        // session guard that settles it is covered in PollLoopHealthTrackerTest.)
+        advanceTimeBy(SETTLE_TIME_MS)
+        assertTrue("relaunched loop must report running", loopHealth.snapshot(PollLoop.FAST).running)
+        coVerify(atLeast = 2) { pumpDriver.getIoB() }
         orchestrator.stop()
     }
 }
