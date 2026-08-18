@@ -5,10 +5,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.pm.ServiceInfo
 import android.os.Build
+import androidx.annotation.RequiresApi
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import com.glycemicgpt.mobile.data.local.AuthTokenStore
 import com.glycemicgpt.mobile.data.repository.AlertRepository
 import com.glycemicgpt.mobile.data.repository.ChatRepository
+import com.glycemicgpt.mobile.service.FgsTimeoutReporter
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.WearableListenerService
@@ -18,6 +21,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.tasks.await
@@ -42,8 +46,12 @@ class WearChatRelayService : WearableListenerService() {
     @Inject lateinit var alertRepository: AlertRepository
     @Inject lateinit var wearDataSender: WearDataSender
     @Inject lateinit var authTokenStore: AuthTokenStore
+    @Inject lateinit var fgsTimeoutReporter: FgsTimeoutReporter
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Visible to the unit test so it can launch work after a timeout and prove the scope is still
+    // alive -- the difference between cancelChildren() and cancel() in onTimeout.
+    @VisibleForTesting
+    internal val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** Tracks active foreground work items. Only stop foreground when count hits 0. */
     private val activeWorkCount = AtomicInteger(0)
@@ -180,12 +188,24 @@ class WearChatRelayService : WearableListenerService() {
         if (activeWorkCount.getAndIncrement() == 0) {
             ensureNotificationChannel()
             val notification = buildNotification()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+                Timber.d("Chat relay promoted to foreground")
+            } catch (e: IllegalStateException) {
+                // Android 15 refuses a dataSync promotion once the shared 24 h budget is spent
+                // (ForegroundServiceStartNotAllowedException, an IllegalStateException). An
+                // uncaught throw here would crash the process and take the pump connection with
+                // it, over a watch chat message. Relay the request unprotected instead -- the
+                // same trade the watch-side receivers already make.
+                fgsTimeoutReporter.recordForegroundStartRejected(
+                    FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
+                    e,
+                )
             }
-            Timber.d("Chat relay promoted to foreground")
         }
     }
 
@@ -247,6 +267,31 @@ class WearChatRelayService : WearableListenerService() {
         } catch (e: Exception) {
             Timber.w(e, "Failed to send error to watch")
         }
+    }
+
+    /**
+     * The app's shared `dataSync` foreground-service budget is spent while this relay held the
+     * foreground state. Stop within the system's few-second window or it throws
+     * `RemoteServiceException` and kills the process along with the pump connection.
+     *
+     * Nothing here blocks or suspends. Nothing is persisted for resume either: a chat request is
+     * request-scoped, the watch shows its own timeout, and re-asking is the user's call.
+     */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        activeWorkCount.set(0)
+        // cancelChildren, not cancel(): GMS keeps a WearableListenerService bound, so stopSelf
+        // need not destroy this instance and the next watch message can land on it. Cancelling
+        // the scope itself would leave it permanently dead.
+        serviceScope.coroutineContext.cancelChildren()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        fgsTimeoutReporter.recordTimeout(
+            component = FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
+            startId = startId,
+            fgsType = fgsType,
+            resumable = false,
+        )
     }
 
     override fun onDestroy() {

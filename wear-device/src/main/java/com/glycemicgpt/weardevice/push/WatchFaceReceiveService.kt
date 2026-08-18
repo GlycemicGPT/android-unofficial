@@ -4,6 +4,9 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.pm.ServiceInfo
+import android.os.Build
+import androidx.annotation.RequiresApi
+import com.glycemicgpt.weardevice.data.FgsTimeoutReporter
 import com.glycemicgpt.weardevice.data.WearDataContract
 import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.Wearable
@@ -15,6 +18,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -58,6 +62,38 @@ class WatchFaceReceiveService : WearableListenerService() {
     private val activePushCount = AtomicInteger(0)
     private val foregroundLock = Any()
 
+    override fun onCreate() {
+        super.onCreate()
+        // Open the timeout store now so [onTimeout], which has only seconds to run, never has
+        // to read a prefs file from disk.
+        FgsTimeoutReporter.init(applicationContext)
+    }
+
+    /**
+     * The app's cumulative `dataSync` foreground-service budget (6 h per 24 h on Wear OS 5+) is
+     * spent while a push was in flight. Stop within the system's few-second window or it throws
+     * `RemoteServiceException` and kills the watch process.
+     *
+     * Dropping the foreground state -- not the cancellation -- is what actually ends the
+     * dataSync billing: a blocking `InputStream.read()` inside the transfer cannot be
+     * interrupted by cancelling its coroutine, which is what the receive watchdog is for. The
+     * phone re-pushes the face when the user asks again, so nothing is persisted for resume.
+     */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        scope.coroutineContext.cancelChildren()
+        synchronized(foregroundLock) {
+            activePushCount.set(0)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
+        stopSelf()
+        FgsTimeoutReporter.recordTimeout(
+            component = FgsTimeoutReporter.COMPONENT_WATCH_FACE_RECEIVE,
+            startId = startId,
+            fgsType = fgsType,
+        )
+    }
+
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         if (channel.path != WearDataContract.WATCHFACE_PUSH_CHANNEL) return
 
@@ -89,7 +125,13 @@ class WatchFaceReceiveService : WearableListenerService() {
                 }
             } finally {
                 synchronized(foregroundLock) {
-                    if (activePushCount.decrementAndGet() == 0) {
+                    // <= 0, not == 0: [onTimeout] zeroes the counter out-of-band while this push
+                    // is still unwinding, so this decrement can land on an already-zero counter.
+                    // An exact-equality test would leave it negative and GMS keeps the instance
+                    // bound, so every later push would skip tryPromoteToForeground and transfer
+                    // with no foreground protection. Same clamp the phone relay's finishWork has.
+                    if (activePushCount.decrementAndGet() <= 0) {
+                        activePushCount.set(0)
                         stopForeground(STOP_FOREGROUND_REMOVE)
                     }
                 }
