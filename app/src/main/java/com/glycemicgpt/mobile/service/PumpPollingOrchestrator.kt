@@ -286,15 +286,16 @@ class PumpPollingOrchestrator @Inject constructor(
                 val backoffMs = restartBackoffMs(restartAttempt)
                 // Loop, cause and liveness are separate format args: "which loop died", "what
                 // killed it" and "how long it has been without a clean iteration" are three
-                // different questions of the same telemetry event.
+                // different questions of the same telemetry event. Exception class only, per the
+                // ERROR/Sentry discipline in [runStep]; the throwable stays at DEBUG.
                 Timber.e(
-                    failure,
                     "Poll loop %s stopped outside a guarded step (%s); restarting in %d ms [%s]",
                     loop.telemetryName,
                     failure?.javaClass?.simpleName ?: "body returned normally",
                     backoffMs,
                     loopHealth.snapshot(loop).telemetrySummary(),
                 )
+                failure?.let { Timber.d(it, "Poll loop %s restart detail", loop.telemetryName) }
                 delay(backoffMs)
                 restartAttempt++
                 nextInitialDelayMs = 0L
@@ -332,12 +333,24 @@ class PumpPollingOrchestrator @Inject constructor(
             // Loop and step are separate format args so a log/Sentry search can isolate either
             // axis: "which loop is broken" and "which step breaks it" are different questions.
             // The liveness summary rides along so the event also answers "and for how long".
+            //
+            // ERROR is forwarded to Sentry as an event, so this line carries the exception CLASS
+            // only; the message and stacktrace stay on-device at DEBUG. Same discipline as
+            // MedtronicReadGateway: the guarded steps parse and persist readings, so an exception
+            // from a parser or a Room write can embed a health value in its message, and the
+            // beforeSend scrub only catches the unit-suffixed ones.
             Timber.e(
-                e,
-                "Poll step failed (loop=%s step=%s); continuing loop [%s]",
+                "Poll step failed (loop=%s step=%s cause=%s); continuing loop [%s]",
                 step.loop.telemetryName,
                 step.telemetryName,
+                e.javaClass.simpleName,
                 loopHealth.snapshot(step.loop).telemetrySummary(),
+            )
+            Timber.d(
+                e,
+                "Poll step failure detail (loop=%s step=%s)",
+                step.loop.telemetryName,
+                step.telemetryName,
             )
             false
         }
