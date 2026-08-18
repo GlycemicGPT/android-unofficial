@@ -200,7 +200,9 @@ class AlertStreamService : Service() {
                 alertStreamStateHolder.onStreamStopped()
                 // GLY-254 owns the full monitoring-health surface and will supersede this
                 // notification.
-                MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                runCatching {
+                    MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                }
                 stopSelf(startId)
                 return START_NOT_STICKY
             }
