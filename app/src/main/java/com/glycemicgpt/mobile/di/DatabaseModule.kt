@@ -8,6 +8,7 @@ import androidx.security.crypto.MasterKey
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.glycemicgpt.mobile.data.local.AppDatabase
 import com.glycemicgpt.mobile.data.local.dao.AlertDao
+import com.glycemicgpt.mobile.data.local.dao.HistoryBackfillCursorDao
 import com.glycemicgpt.mobile.data.local.dao.PumpDao
 import com.glycemicgpt.mobile.data.local.dao.RawHistoryLogDao
 import com.glycemicgpt.mobile.data.local.dao.SyncDao
@@ -110,11 +111,50 @@ object DatabaseModule {
         }
     }
 
+    /**
+     * Migration 13->14: split raw-download progress from processing progress (GLY-250).
+     *
+     * Adds `raw_history_logs.processed` and a single-row `history_backfill_cursor` table. From
+     * here on the backfill inserts raw rows unprocessed, then commits the derived CGM/bolus/basal
+     * rows, their sync-queue entries, the `processed` flags and the cursor in ONE transaction --
+     * so a process death mid-batch rolls the whole batch back and the next run redoes it, instead
+     * of resuming above records that were never derived.
+     *
+     * Both backfills preserve the pre-migration meaning of the old anchor exactly, and they have
+     * to agree with each other:
+     *  - the cursor starts at `MAX(sequenceNumber)`, which IS the anchor the poller was using, so
+     *    an upgrade never re-downloads the pump's whole history; and
+     *  - existing rows are marked processed, because that same anchor already declared everything
+     *    at or below it done.
+     * Seeding them any other way would have the two markers contradict each other on day one. The
+     * cost is that records lost to the old bug stay lost -- nothing recorded which batch died, so
+     * the alternative is re-deriving every retained raw row on upgrade, and the new guarantee
+     * covers every batch from here.
+     */
+    private val MIGRATION_13_14 = object : Migration(13, 14) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE raw_history_logs ADD COLUMN processed INTEGER NOT NULL DEFAULT 0",
+            )
+            db.execSQL("UPDATE raw_history_logs SET processed = 1")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `history_backfill_cursor` " +
+                    "(`id` INTEGER NOT NULL, `processedThroughSequence` INTEGER NOT NULL, " +
+                    "`updatedAtMs` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+            )
+            db.execSQL(
+                "INSERT OR REPLACE INTO history_backfill_cursor " +
+                    "(id, processedThroughSequence, updatedAtMs) " +
+                    "SELECT 0, COALESCE(MAX(sequenceNumber), 0), 0 FROM raw_history_logs",
+            )
+        }
+    }
+
     /** All schema migrations, in order. Single source of truth shared by the database builder
      *  and the instrumented migration tests. */
     internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
         MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
-        MIGRATION_11_12, MIGRATION_12_13,
+        MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
     )
 
     /**
@@ -201,4 +241,8 @@ object DatabaseModule {
 
     @Provides
     fun provideAlertDao(db: AppDatabase): AlertDao = db.alertDao()
+
+    @Provides
+    fun provideHistoryBackfillCursorDao(db: AppDatabase): HistoryBackfillCursorDao =
+        db.historyBackfillCursorDao()
 }

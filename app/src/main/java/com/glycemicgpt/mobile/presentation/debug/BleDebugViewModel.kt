@@ -99,9 +99,11 @@ class BleDebugViewModel @Inject constructor(
     }
 
     /**
-     * Debug-only: seed a batch of synthetic basal events into the sync queue through the same
-     * production seam the poll loop uses ([SyncQueueEnqueuer.enqueueBasalBatch], so the
-     * backend-configured gate still applies). The emulator has no BLE pump, so nothing else
+     * Debug-only: seed a batch of synthetic basal events into the sync queue through
+     * [SyncQueueEnqueuer.enqueueBasalBatch], so the backend-configured gate still applies. (The
+     * history backfill builds its queue rows through the same enqueuer but inserts them inside
+     * its own batch transaction — see HistoryBackfillWriter — so this seam no longer mirrors it
+     * exactly; the rows it produces are identical.) The emulator has no BLE pump, so nothing else
      * ever fills the queue there; this makes the outage-retention E2E (queue survives a
      * sustained transport outage, then drains on reconnect) reproducible. Distinct timestamps
      * per event keep the backend's natural-key dedupe from collapsing the batch. The

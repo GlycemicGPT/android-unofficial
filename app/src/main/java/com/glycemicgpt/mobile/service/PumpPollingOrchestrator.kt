@@ -4,10 +4,9 @@ import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.local.GlucoseRangeStore
 import com.glycemicgpt.mobile.data.local.SafetyLimitsStore
 import com.glycemicgpt.mobile.domain.alerting.AlertTypes
-import com.glycemicgpt.mobile.data.local.dao.RawHistoryLogDao
 import com.glycemicgpt.mobile.domain.format.GlucoseFormat
 import com.glycemicgpt.mobile.domain.model.PumpActivityMode
-import com.glycemicgpt.mobile.data.local.entity.RawHistoryLogEntity
+import com.glycemicgpt.mobile.data.repository.HistoryBackfillWriter
 import com.glycemicgpt.mobile.data.repository.PumpDataRepository
 import com.glycemicgpt.mobile.data.repository.SyncQueueEnqueuer
 import com.glycemicgpt.mobile.domain.model.CgmReading
@@ -47,7 +46,9 @@ import javax.inject.Singleton
  * stop that:
  * 1. Every step runs through [runStep]: a throw is reported against (loop, step) and the loop
  *    moves on to the next step. One bad row, parse, or sync enqueue costs one reading, not history
- *    backfill forever.
+ *    backfill forever. The history step is the one place a failure costs the whole unit of work:
+ *    a backfill batch is all-or-nothing by design (GLY-250), so it is re-fetched next cycle
+ *    rather than half-committed.
  * 2. Each loop body runs under [superviseLoop]: anything that escapes the step guards is reported,
  *    backed off, and the loop is relaunched rather than left dead.
  * 3. Every loop publishes a heartbeat to [PollLoopHealthTracker] — the timestamp of the last
@@ -65,7 +66,7 @@ class PumpPollingOrchestrator @Inject constructor(
     private val pumpDriver: PumpDriver,
     private val repository: PumpDataRepository,
     private val syncEnqueuer: SyncQueueEnqueuer,
-    private val rawHistoryLogDao: RawHistoryLogDao,
+    private val historyBackfill: HistoryBackfillWriter,
     private val wearDataSender: WearDataSender,
     private val glucoseRangeStore: GlucoseRangeStore,
     private val safetyLimitsStore: SafetyLimitsStore,
@@ -79,7 +80,9 @@ class PumpPollingOrchestrator @Inject constructor(
     @Volatile
     var backendSyncManager: BackendSyncManager? = null
 
-    /** Track the last known raw event sequence number to fetch incrementally. */
+    /** The sequence number the next history fetch resumes from: the in-memory mirror of the
+     *  persisted backfill cursor. It moves only after a batch's derived records are committed,
+     *  never at the raw insert — see [readSequenceAnchor] and [HistoryBackfillWriter]. */
     @Volatile
     private var lastSequenceNumber: Int = 0
 
@@ -236,13 +239,19 @@ class PumpPollingOrchestrator @Inject constructor(
     }
 
     /**
-     * Resolve the history resume anchor — the highest sequence number already stored — so the
-     * backfill continues where it left off instead of re-reading the pump's whole history.
+     * Resolve the history resume anchor — the highest sequence number whose DERIVED records are
+     * committed — so the backfill continues where it left off instead of re-reading the pump's
+     * whole history.
+     *
+     * Reads the persisted backfill cursor, not `MAX(sequenceNumber)` of the raw table (GLY-250).
+     * The raw table advances at the raw insert, ahead of the CGM/bolus/basal writes it feeds, so
+     * anchoring on it resumed above records that were never derived and lost them for good.
+     * A null cursor is a fresh install; anything else throws and stays distinguishable from one.
      *
      * Throws whatever Room throws; both callers decide what that means for them.
      */
     private suspend fun readSequenceAnchor() {
-        lastSequenceNumber = rawHistoryLogDao.getMaxSequenceNumber() ?: 0
+        lastSequenceNumber = historyBackfill.processedThroughSequence() ?: 0
         sequenceAnchorRestored = true
     }
 
@@ -810,6 +819,13 @@ class PumpPollingOrchestrator @Inject constructor(
      * On fresh installs (lastSequenceNumber == 0), performs a full initial sync
      * with extended duration (10 minutes) and requests the full pump history
      * from the BLE driver (no lookback limit, larger batch caps).
+     *
+     * Batch persistence is all-or-nothing and the resume cursor is the last thing to move
+     * (GLY-250) — see [HistoryBackfillWriter]. A batch that fails anywhere is simply re-fetched
+     * next cycle, so a record this build cannot parse or persist stalls the backfill at that
+     * batch rather than skipping past it. That is the deliberate trade: a stall freezes the slow
+     * loop's heartbeat and reports on the failure ladder, where skipping was silent and
+     * permanent.
      */
     private suspend fun pollHistoryLogs() {
         // Retry a resume anchor the connection watcher could not read. Deliberately unguarded: a
@@ -863,49 +879,45 @@ class PumpPollingOrchestrator @Inject constructor(
             batchCount++
             totalRecords += records.size
 
-            // Persist raw history log records
-            val entities = records.map { record ->
-                RawHistoryLogEntity(
-                    sequenceNumber = record.sequenceNumber,
-                    rawBytesB64 = record.rawBytesB64,
-                    eventTypeId = record.eventTypeId,
-                    pumpTimeSeconds = record.pumpTimeSeconds,
-                )
-            }
-            rawHistoryLogDao.insertAll(entities)
-            val newMaxSeq = records.maxOfOrNull { it.sequenceNumber } ?: lastSequenceNumber
-            if (newMaxSeq <= lastSequenceNumber) {
+            val batchMaxSeq = records.maxOfOrNull { it.sequenceNumber } ?: lastSequenceNumber
+            if (batchMaxSeq <= lastSequenceNumber) {
                 Timber.w("History sequence not advancing (batch %d, stuck at %d), breaking", batchCount, lastSequenceNumber)
                 break
             }
-            lastSequenceNumber = newMaxSeq
-            Timber.d(
-                "Fetched batch %d: %d history records, %d total so far (seq up to %d)",
-                batchCount, records.size, totalRecords, lastSequenceNumber,
+
+            // Raw bytes first, marked unprocessed: they are the only copy of what the pump said,
+            // so they are kept whatever happens to the derivation below — and an unprocessed row
+            // is re-derivable locally, without asking the pump again.
+            historyBackfill.persistRawBatch(records)
+
+            // Parsing happens outside the transaction: it is pure CPU work with no business
+            // holding the write lock, and a record this build cannot parse must fail the batch
+            // before anything derived is committed.
+            val cgmReadings = historyLogParser.extractCgmFromHistoryLogs(records, limits)
+            val bolusEvents = historyLogParser.extractBolusesFromHistoryLogs(records, limits)
+            val basalReadings = historyLogParser.extractBasalFromHistoryLogs(records, limits)
+
+            // One transaction: derived rows + their sync-queue entries + the raw rows' processed
+            // flags + the resume cursor. All of it lands or none of it does, so a process death
+            // anywhere in this batch costs a re-fetch, never a record.
+            historyBackfill.commitDerivedBatch(
+                cgmReadings = cgmReadings,
+                bolusEvents = bolusEvents,
+                basalReadings = basalReadings,
+                fromExclusive = lastSequenceNumber,
+                throughInclusive = batchMaxSeq,
             )
 
-            // Extract and save CGM readings to fill chart gaps
-            val cgmReadings = historyLogParser.extractCgmFromHistoryLogs(records, limits)
-            if (cgmReadings.isNotEmpty()) {
-                repository.saveCgmBatch(cgmReadings)
-                totalCgm += cgmReadings.size
-            }
-
-            // Extract and save bolus events
-            val bolusEvents = historyLogParser.extractBolusesFromHistoryLogs(records, limits)
-            if (bolusEvents.isNotEmpty()) {
-                repository.saveBoluses(bolusEvents)
-                syncEnqueuer.enqueueBoluses(bolusEvents)
-                totalBolus += bolusEvents.size
-            }
-
-            // Extract and save basal delivery events
-            val basalReadings = historyLogParser.extractBasalFromHistoryLogs(records, limits)
-            if (basalReadings.isNotEmpty()) {
-                repository.saveBasalBatch(basalReadings)
-                syncEnqueuer.enqueueBasalBatch(basalReadings)
-                totalBasal += basalReadings.size
-            }
+            // Only now, past the commit, may the in-memory cursor move: it is the anchor the next
+            // fetch resumes from, and it must never run ahead of what is durable.
+            lastSequenceNumber = batchMaxSeq
+            totalCgm += cgmReadings.size
+            totalBolus += bolusEvents.size
+            totalBasal += basalReadings.size
+            Timber.d(
+                "Committed batch %d: %d history records, %d total so far (seq up to %d)",
+                batchCount, records.size, totalRecords, lastSequenceNumber,
+            )
 
             // Trigger backend sync after each batch so data is uploaded incrementally
             backendSyncManager?.triggerSync()

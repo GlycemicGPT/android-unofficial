@@ -58,6 +58,43 @@ class SyncQueueEnqueuer @Inject constructor(
         enqueue(listOf(PumpEventMapper.fromReservoir(reading)))
     }
 
+    /**
+     * Builds the queue rows for a history-backfill batch WITHOUT inserting them, so the caller
+     * can insert them inside the transaction that writes the derived records they describe
+     * (GLY-250). A batch that rolls back must not leave queued uploads for rows that no longer
+     * exist, and the only way to guarantee that is for the insert to share the batch's
+     * transaction.
+     *
+     * The mode gate and the JSON encoding happen here, deliberately outside that transaction:
+     * reading the encrypted token store and serializing a few hundred events have no business
+     * holding the write lock.
+     *
+     * Failures return an empty list rather than throwing, matching [enqueue] -- a dropped sync
+     * row is harmless, and failing the caller's transaction over one would cost the derived
+     * records too.
+     */
+    suspend fun buildBackfillRows(
+        boluses: List<BolusEvent>,
+        basal: List<BasalReading>,
+    ): List<SyncQueueEntity> = try {
+        if ((boluses.isEmpty() && basal.isEmpty()) || !authTokenStore.isBackendConfigured()) {
+            emptyList()
+        } else {
+            val dtos = boluses.map { PumpEventMapper.fromBolus(it) } +
+                basal.map { PumpEventMapper.fromBasal(it) }
+            dtos.map { it.toQueueRow() }
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Timber.w(
+            e,
+            "Sync row build failed; dropped %d backfill event(s)",
+            boluses.size + basal.size,
+        )
+        emptyList()
+    }
+
     private suspend fun enqueue(dtos: List<PumpEventDto>) {
         try {
             // Single funnel for the mode gate, checked once per call so history-backfill
@@ -67,15 +104,7 @@ class SyncQueueEnqueuer @Inject constructor(
             if (dtos.isEmpty() || !authTokenStore.isBackendConfigured()) return
             // One transactional insert: all rows land or none do, so the dropped-count log
             // below is accurate on failure.
-            syncDao.enqueueAll(
-                dtos.map { dto ->
-                    SyncQueueEntity(
-                        eventType = dto.eventType,
-                        eventTimestampMs = dto.eventTimestamp.toEpochMilli(),
-                        payload = adapter.toJson(dto),
-                    )
-                },
-            )
+            syncDao.enqueueAll(dtos.map { it.toQueueRow() })
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -85,4 +114,10 @@ class SyncQueueEnqueuer @Inject constructor(
             Timber.w(e, "Sync enqueue failed; dropped %d pump event(s)", dtos.size)
         }
     }
+
+    private fun PumpEventDto.toQueueRow() = SyncQueueEntity(
+        eventType = eventType,
+        eventTimestampMs = eventTimestamp.toEpochMilli(),
+        payload = adapter.toJson(this),
+    )
 }
