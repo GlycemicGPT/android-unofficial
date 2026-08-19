@@ -216,6 +216,21 @@ class DataSyncTimeoutCoverageTest {
                     "transfer whose promotion was refused then costs the process",
                 body.contains("getAndIncrement"),
             )
+            // Naming getAndIncrement alone only rules out the form the bug arrived in: a
+            // `if (activePushCount.get() == 0) tryPromoteToForeground()` reads differently and
+            // fails identically. Requiring the promotion before the counter is consulted at all
+            // rejects every counter-gated shape, while leaving the demotion below it free to keep
+            // reading the counter -- which it must.
+            val counterRead = body.indexOf("activePushCount")
+            assertTrue(
+                "$className: onStartCommand must keep gating its demotion on activePushCount -- " +
+                    "an unconditional stopForeground drops a transfer already under way",
+                counterRead >= 0,
+            )
+            assertTrue(
+                "$className: onStartCommand must promote before it consults activePushCount",
+                body.indexOf("tryPromoteToForeground()") < counterRead,
+            )
         }
     }
 

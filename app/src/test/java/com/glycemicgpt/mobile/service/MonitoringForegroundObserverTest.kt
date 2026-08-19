@@ -6,8 +6,12 @@ import android.app.Activity
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
+import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
+import timber.log.Timber
 import javax.inject.Provider
 
 /**
@@ -31,6 +35,23 @@ class MonitoringForegroundObserverTest {
             reconciler
         },
     )
+
+    private val logs = mutableListOf<Pair<Int, String>>()
+    private val tree = object : Timber.Tree() {
+        override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
+            logs += priority to message
+        }
+    }
+
+    @Before
+    fun setUp() {
+        Timber.plant(tree)
+    }
+
+    @After
+    fun tearDown() {
+        Timber.uproot(tree)
+    }
 
     private fun activity(): Activity = mockk(relaxed = true)
 
@@ -77,6 +98,42 @@ class MonitoringForegroundObserverTest {
         // build the keystore-backed credential store for no reason.
         assertEquals(0, resolutions)
         verify(exactly = 0) { reconciler.reconcile(any()) }
+    }
+
+    @Test
+    fun `a credential store that cannot be opened skips the reconcile instead of crashing`() {
+        // Resolving the Provider builds the keystore-backed PumpCredentialStore, whose init can
+        // throw on a keystore or corrupted-prefs failure -- outside every guard the reconciler
+        // puts around its own reads. Escaping an ActivityLifecycleCallbacks callback would crash
+        // the app on every open, which is worse than the missing service it is reporting.
+        val failing = MonitoringForegroundObserver(
+            Provider { throw IllegalStateException("keystore unavailable") },
+        )
+
+        failing.onActivityStarted(activity())
+
+        val line = logs.single { it.second.startsWith(MonitoringReconciler.RECONCILE_EVENT_TAG) }
+        assertEquals(
+            "an app that opens with monitoring off is a breadcrumb, not an INFO line",
+            android.util.Log.WARN,
+            line.first,
+        )
+        assertTrue(line.second.contains("decision=CREDENTIALS_UNREADABLE"))
+    }
+
+    @Test
+    fun `a reconcile that throws is contained the same way`() {
+        // The reconciler documents that nothing in it may throw; the guard here does not take that
+        // on trust, because the cost of being wrong is a crash on every app open.
+        every { reconciler.reconcile(any()) } throws IllegalStateException("keystore unavailable")
+
+        observer.onActivityStarted(activity())
+
+        verify(exactly = 1) { reconciler.reconcile(MonitoringReconcileTrigger.APP_FOREGROUNDED) }
+        assertTrue(
+            logs.single { it.second.startsWith(MonitoringReconciler.RECONCILE_EVENT_TAG) }
+                .second.contains("decision=CREDENTIALS_UNREADABLE"),
+        )
     }
 
     @Test

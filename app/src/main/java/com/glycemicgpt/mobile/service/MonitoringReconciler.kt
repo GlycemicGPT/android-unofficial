@@ -61,21 +61,27 @@ class MonitoringReconciler @Inject constructor(
      * [MonitoringReconcileDecision.ALREADY_RUNNING] without re-issuing a start.
      */
     fun reconcile(trigger: MonitoringReconcileTrigger): MonitoringReconcileDecision {
-        val decision = decide(trigger)
-        report(trigger, decision)
-        return decision
+        val outcome = decide(trigger)
+        report(trigger, outcome.decision, outcome.cause)
+        return outcome.decision
     }
 
-    private fun decide(trigger: MonitoringReconcileTrigger): MonitoringReconcileDecision {
-        if (!shouldMonitor()) return MonitoringReconcileDecision.NOT_PAIRED
-        if (isPumpConnectionRunning()) return MonitoringReconcileDecision.ALREADY_RUNNING
+    private fun decide(trigger: MonitoringReconcileTrigger): Outcome {
+        val paired = readIsPaired().getOrElse { failure ->
+            return Outcome(
+                MonitoringReconcileDecision.CREDENTIALS_UNREADABLE,
+                failure.javaClass.simpleName,
+            )
+        }
+        if (!paired) return Outcome(MonitoringReconcileDecision.NOT_PAIRED)
+        if (isPumpConnectionRunning()) return Outcome(MonitoringReconcileDecision.ALREADY_RUNNING)
         if (!trigger.foregroundStartIsLegal && !backgroundStartEligibility.isEligible()) {
-            return MonitoringReconcileDecision.DEFERRED_INELIGIBLE
+            return Outcome(MonitoringReconcileDecision.DEFERRED_INELIGIBLE)
         }
         // Rejections are caught, classified, durably recorded and surfaced to the user inside
         // PumpConnectionService.start/ForegroundServiceStarter -- this only needs the verdict.
         val result = PumpConnectionService.start(context)
-        return when {
+        val decision = when {
             // A refusal with the service demonstrably alive is the tail of the race the
             // isPumpConnectionRunning() check above loses: the service came up between that probe
             // and this start, and the platform refused the redundant start on top of it.
@@ -88,15 +94,20 @@ class MonitoringReconciler @Inject constructor(
                 MonitoringReconcileDecision.START_REJECTED
             else -> MonitoringReconcileDecision.STARTED
         }
+        return Outcome(decision)
     }
 
     /**
      * The credential store is keystore-backed, so a read is not the pure in-memory lookup its
-     * signature suggests; an unreadable store means "we cannot show we are paired", which must
-     * decide against starting rather than propagate out of a receiver.
+     * signature suggests; an unreadable store must decide against starting rather than propagate
+     * out of a receiver.
+     *
+     * The failure is kept as a failure rather than folded into `false`. "We cannot tell whether a
+     * pump is paired" and "no pump is paired" leave the same service not running, but only the
+     * first one is wrong: collapsing them reports a paired user's dead monitoring as the routine
+     * [MonitoringReconcileDecision.NOT_PAIRED] no-op, at INFO, with no breadcrumb (PR #46 review).
      */
-    private fun shouldMonitor(): Boolean =
-        runCatching { pumpCredentialStore.isPaired() }.getOrDefault(false)
+    private fun readIsPaired(): Result<Boolean> = runCatching { pumpCredentialStore.isPaired() }
 
     /**
      * Reads the live service's own state, the same probe [PumpConnectionService.start] uses to
@@ -115,8 +126,9 @@ class MonitoringReconciler @Inject constructor(
         runCatching { PumpConnectionService.isRunning() }.getOrDefault(false)
 
     /**
-     * One line per reconcile, carrying the trigger and the decision and nothing else -- both are
-     * enums, so there is no device or user data to leak into a telemetry event.
+     * One line per reconcile, carrying the trigger, the decision, and -- only when a decision was
+     * forced by a caught exception -- that exception's class name. Two enums and a class name, so
+     * there is no device or user data to leak into a telemetry event.
      *
      * Level is chosen by outcome, because [Timber] is the app's telemetry channel:
      * `SentryTimberIntegration` is installed at (ERROR event, WARNING breadcrumb), so a decision
@@ -128,20 +140,47 @@ class MonitoringReconciler @Inject constructor(
     private fun report(
         trigger: MonitoringReconcileTrigger,
         decision: MonitoringReconcileDecision,
+        cause: String?,
     ) {
+        val suffix = if (cause == null) "" else " cause=$cause"
         if (decision.monitoringOff) {
             Timber.w(
-                "%s trigger=%s decision=%s -- monitoring is not running",
-                RECONCILE_EVENT_TAG, trigger.name, decision.name,
+                "%s trigger=%s decision=%s%s -- monitoring is not running",
+                RECONCILE_EVENT_TAG, trigger.name, decision.name, suffix,
             )
         } else {
-            Timber.i("%s trigger=%s decision=%s", RECONCILE_EVENT_TAG, trigger.name, decision.name)
+            Timber.i(
+                "%s trigger=%s decision=%s%s",
+                RECONCILE_EVENT_TAG, trigger.name, decision.name, suffix,
+            )
         }
     }
+
+    /** A decision, plus the exception class that forced it when one did. Class name only. */
+    private data class Outcome(
+        val decision: MonitoringReconcileDecision,
+        val cause: String? = null,
+    )
 
     companion object {
         /** Stable prefix on every reconcile report, for logcat greps and Sentry search. */
         const val RECONCILE_EVENT_TAG = "MONITORING_RECONCILE"
+
+        /**
+         * The one report a [MonitoringReconciler] cannot make about itself: *constructing* it is
+         * what opens the keystore-backed [PumpCredentialStore], so a failure there leaves no
+         * instance to report through. Same tag, decision and shape as [report], so one logcat grep
+         * or Sentry search covers an unreadable store however it failed.
+         */
+        fun reportUnavailable(trigger: MonitoringReconcileTrigger, failure: Throwable) {
+            Timber.w(
+                "%s trigger=%s decision=%s cause=%s -- monitoring is not running",
+                RECONCILE_EVENT_TAG,
+                trigger.name,
+                MonitoringReconcileDecision.CREDENTIALS_UNREADABLE.name,
+                failure.javaClass.simpleName,
+            )
+        }
     }
 }
 
@@ -226,6 +265,14 @@ enum class MonitoringReconcileDecision(internal val monitoringOff: Boolean) {
 
     /** No pump is paired, so there is nothing to monitor. */
     NOT_PAIRED(monitoringOff = false),
+
+    /**
+     * The keystore-backed credential store could not be read or built, so pairing state is
+     * unknown. Distinct from [NOT_PAIRED] and marked [monitoringOff] deliberately: a paired user
+     * whose store stopped opening gets no monitoring at all, and reporting that as "nothing to
+     * monitor" at INFO would hide the one deferred outcome worth a breadcrumb.
+     */
+    CREDENTIALS_UNREADABLE(monitoringOff = true),
 
     /** A background trigger with no exemption: left for the next legal trigger to pick up. */
     DEFERRED_INELIGIBLE(monitoringOff = true),

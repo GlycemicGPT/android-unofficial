@@ -36,7 +36,22 @@ class MonitoringForegroundObserver(
 
     override fun onActivityStarted(activity: Activity) {
         if (startedActivities++ == 0) {
-            reconciler.get().reconcile(MonitoringReconcileTrigger.APP_FOREGROUNDED)
+            // Resolving the Provider is what *constructs* PumpCredentialStore, whose init calls
+            // MasterKeys.getOrCreate and EncryptedSharedPreferences.create -- both throw on a
+            // keystore or corrupted-prefs failure, and both sit outside every runCatching
+            // MonitoringReconciler puts around its own reads. An escape from here escapes an
+            // ActivityLifecycleCallbacks callback, which is an app crash on every single app open:
+            // the failure mode this class exists to remove, not one it may reintroduce. Skipping
+            // the reconcile leaves monitoring off, so the skip is reported the way the reconciler
+            // reports its own monitoring-off decisions.
+            runCatching {
+                reconciler.get().reconcile(MonitoringReconcileTrigger.APP_FOREGROUNDED)
+            }.onFailure {
+                MonitoringReconciler.reportUnavailable(
+                    MonitoringReconcileTrigger.APP_FOREGROUNDED,
+                    it,
+                )
+            }
         }
     }
 

@@ -103,8 +103,31 @@ class MonitoringReconcilerTest {
 
         val decision = reconciler.reconcile(MonitoringReconcileTrigger.BOOT_COMPLETED)
 
-        assertEquals(MonitoringReconcileDecision.NOT_PAIRED, decision)
+        assertEquals(MonitoringReconcileDecision.CREDENTIALS_UNREADABLE, decision)
         verify(exactly = 0) { PumpConnectionService.start(any()) }
+    }
+
+    @Test
+    fun `an unreadable credential store is a breadcrumb, not a not-paired no-op`() {
+        // Collapsing "we cannot tell" into NOT_PAIRED reports a paired user's monitoring being
+        // off at INFO, as the routine nothing-to-do case -- no breadcrumb on the report they file
+        // next, and nothing anywhere saying monitoring never came up.
+        every { credentialStore.isPaired() } throws IllegalStateException("keystore unavailable")
+
+        reconciler.reconcile(MonitoringReconcileTrigger.APP_FOREGROUNDED)
+
+        val line = logs.single { it.second.startsWith(MonitoringReconciler.RECONCILE_EVENT_TAG) }
+        assertEquals(
+            "SentryTimberIntegration turns WARN into the breadcrumb that explains a later report",
+            android.util.Log.WARN,
+            line.first,
+        )
+        assertEquals(
+            "${MonitoringReconciler.RECONCILE_EVENT_TAG} trigger=APP_FOREGROUNDED " +
+                "decision=CREDENTIALS_UNREADABLE cause=IllegalStateException " +
+                "-- monitoring is not running",
+            line.second,
+        )
     }
 
     @Test
