@@ -114,29 +114,37 @@ object DatabaseModule {
     /**
      * Migration 13->14: split raw-download progress from processing progress (GLY-250).
      *
-     * Adds `raw_history_logs.processed` and a single-row `history_backfill_cursor` table. From
-     * here on the backfill inserts raw rows unprocessed, then commits the derived CGM/bolus/basal
-     * rows, their sync-queue entries, the `processed` flags and the cursor in ONE transaction --
-     * so a process death mid-batch rolls the whole batch back and the next run redoes it, instead
-     * of resuming above records that were never derived.
+     * Adds `raw_history_logs.processed`, a single-row `history_backfill_cursor` table, and a
+     * dedupe key on `sync_queue`. From here on the backfill inserts raw rows unprocessed, then
+     * commits the derived CGM/bolus/basal rows, their sync-queue entries, the `processed` flags
+     * and the cursor in ONE transaction -- so a process death mid-batch rolls the whole batch
+     * back and the next run redoes it, instead of resuming above records that were never derived.
      *
-     * Both backfills preserve the pre-migration meaning of the old anchor exactly, and they have
-     * to agree with each other:
-     *  - the cursor starts at `MAX(sequenceNumber)`, which IS the anchor the poller was using, so
-     *    an upgrade never re-downloads the pump's whole history; and
-     *  - existing rows are marked processed, because that same anchor already declared everything
-     *    at or below it done.
-     * Seeding them any other way would have the two markers contradict each other on day one. The
-     * cost is that records lost to the old bug stay lost -- nothing recorded which batch died, so
-     * the alternative is re-deriving every retained raw row on upgrade, and the new guarantee
-     * covers every batch from here.
+     * WHAT IT DOES TO EXISTING DATA: it only adds. Nothing is dropped, recreated, copied or
+     * rewritten; every existing row keeps its values.
+     *
+     * The two backfill statements say different things on purpose, because on this one upgrade
+     * they genuinely know different amounts:
+     *  - the cursor starts at `MAX(sequenceNumber)`, which IS the anchor the old poller was
+     *    using, so an upgrade neither re-downloads the pump's whole history nor skips anything
+     *    the old build had already fetched; but
+     *  - retained raw rows stay `processed = 0`, i.e. "derivation unknown". The v13 bug this
+     *    story fixes is precisely that a batch's raw rows could be inserted while its derived
+     *    rows were never written, and NOTHING recorded which batch that was. Declaring them all
+     *    processed would hide the only recoverable copy of exactly the data that was lost, on
+     *    every existing device, in a step that cannot be walked back. Leaving them unprocessed
+     *    costs one idempotent local re-derivation pass over the retained rows (GLY-251) and
+     *    recovers whatever the old build dropped; the derived tables and the upload queue all
+     *    dedupe, so re-deriving a row that was fine is a no-op.
+     *
+     * WHAT A DOWNGRADE DOES: nothing, loudly. See the database builder -- an older build meeting
+     * schema 14 now fails to open instead of wiping the database.
      */
     private val MIGRATION_13_14 = object : Migration(13, 14) {
         override fun migrate(db: SupportSQLiteDatabase) {
             db.execSQL(
                 "ALTER TABLE raw_history_logs ADD COLUMN processed INTEGER NOT NULL DEFAULT 0",
             )
-            db.execSQL("UPDATE raw_history_logs SET processed = 1")
             db.execSQL(
                 "CREATE TABLE IF NOT EXISTS `history_backfill_cursor` " +
                     "(`id` INTEGER NOT NULL, `processedThroughSequence` INTEGER NOT NULL, " +
@@ -147,6 +155,14 @@ object DatabaseModule {
                     "(id, processedThroughSequence, updatedAtMs) " +
                     "SELECT 0, COALESCE(MAX(sequenceNumber), 0), 0 FROM raw_history_logs",
             )
+            // Upload identity for rows that must not be queued twice. Existing rows keep NULL,
+            // which SQLite treats as distinct in a unique index, so nothing already queued is
+            // collapsed or dropped by the new index.
+            db.execSQL("ALTER TABLE sync_queue ADD COLUMN dedupeKey TEXT")
+            db.execSQL(
+                "CREATE UNIQUE INDEX IF NOT EXISTS `index_sync_queue_dedupeKey` " +
+                    "ON `sync_queue` (`dedupeKey`)",
+            )
         }
     }
 
@@ -156,6 +172,11 @@ object DatabaseModule {
         MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
         MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
     )
+
+    /** Schema versions with no migration path forward: [ALL_MIGRATIONS] starts at 6->7, so a
+     *  database still at 1..5 can only be recreated. These are the only versions the builder
+     *  is allowed to be destructive about. */
+    internal val PRE_MIGRATION_CHAIN_VERSIONS: IntArray = intArrayOf(1, 2, 3, 4, 5)
 
     /**
      * Retrieve or generate the database passphrase from EncryptedSharedPreferences.
@@ -226,7 +247,21 @@ object DatabaseModule {
         return Room.databaseBuilder(context, AppDatabase::class.java, "glycemicgpt_encrypted.db")
             .openHelperFactory(factory)
             .addMigrations(*ALL_MIGRATIONS)
-            .fallbackToDestructiveMigration()
+            // Destructive fallback ONLY for the schema versions that predate the migration chain
+            // (the chain starts at 6->7, so 1..5 have no path forward and never had one). What
+            // this deliberately no longer covers is the DOWNGRADE case: the plain
+            // `fallbackToDestructiveMigration()` that used to be here also sets
+            // `allowDestructiveMigrationOnDowngrade`, so a device that had migrated to a newer
+            // schema and then installed an older build had its database silently dropped and
+            // recreated -- local pump history, the raw rows a re-derivation pass needs, and the
+            // whole pending upload queue, gone with no error and no way back. Failing to open is
+            // recoverable (reinstall the newer build, or ship a real downgrade migration);
+            // wiping is not. Add the version here only when losing that data is genuinely the
+            // intended outcome. (GLY-250)
+            .fallbackToDestructiveMigrationFrom(
+                dropAllTables = true,
+                *PRE_MIGRATION_CHAIN_VERSIONS,
+            )
             .build()
     }
 

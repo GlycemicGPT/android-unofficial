@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 14,
-    "identityHash": "74d1faddf0d72796d18e063ffa1a544c",
+    "identityHash": "812fd73e8e0df803e7f69da61927095d",
     "entities": [
       {
         "tableName": "iob_readings",
@@ -291,7 +291,7 @@
       },
       {
         "tableName": "sync_queue",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `eventType` TEXT NOT NULL, `eventTimestampMs` INTEGER NOT NULL, `payload` TEXT NOT NULL, `status` TEXT NOT NULL, `retryCount` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastAttemptMs` INTEGER NOT NULL, `errorMessage` TEXT)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `eventType` TEXT NOT NULL, `eventTimestampMs` INTEGER NOT NULL, `payload` TEXT NOT NULL, `dedupeKey` TEXT, `status` TEXT NOT NULL, `retryCount` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastAttemptMs` INTEGER NOT NULL, `errorMessage` TEXT)",
         "fields": [
           {
             "fieldPath": "id",
@@ -316,6 +316,12 @@
             "columnName": "payload",
             "affinity": "TEXT",
             "notNull": true
+          },
+          {
+            "fieldPath": "dedupeKey",
+            "columnName": "dedupeKey",
+            "affinity": "TEXT",
+            "notNull": false
           },
           {
             "fieldPath": "status",
@@ -364,6 +370,15 @@
             ],
             "orders": [],
             "createSql": "CREATE INDEX IF NOT EXISTS `index_sync_queue_status_createdAtMs` ON `${TABLE_NAME}` (`status`, `createdAtMs`)"
+          },
+          {
+            "name": "index_sync_queue_dedupeKey",
+            "unique": true,
+            "columnNames": [
+              "dedupeKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_sync_queue_dedupeKey` ON `${TABLE_NAME}` (`dedupeKey`)"
           }
         ],
         "foreignKeys": []
@@ -653,7 +668,7 @@
     "views": [],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '74d1faddf0d72796d18e063ffa1a544c')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '812fd73e8e0df803e7f69da61927095d')"
     ]
   }
 }

@@ -13,6 +13,7 @@ import com.glycemicgpt.mobile.domain.model.BasalReading
 import com.glycemicgpt.mobile.domain.model.BolusEvent
 import com.glycemicgpt.mobile.domain.model.CgmReading
 import com.glycemicgpt.mobile.domain.model.HistoryLogRecord
+import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -34,9 +35,10 @@ import javax.inject.Singleton
  *  2. [commitDerivedBatch] writes the derived rows, their sync-queue entries, the `processed`
  *     flags and the resume cursor in ONE transaction. Either all of that is durable or none of
  *     it is, so a kill at any instant leaves the cursor where it was and the next run redoes the
- *     batch from the pump. Re-doing it is idempotent: raw inserts ignore duplicate sequence
- *     numbers, derived rows collapse on their unique timestamp indices, and the queue rows for a
- *     rolled-back batch never existed.
+ *     batch from the pump. Re-doing it is idempotent all the way to the upload: raw inserts
+ *     ignore duplicate sequence numbers, derived rows collapse on their unique timestamp
+ *     indices, the queue rows for a rolled-back batch never existed, and a batch that is
+ *     re-committed cannot queue its uploads twice because those rows carry a dedupe key.
  *
  * Nothing here catches: callers run inside the poll loop's step guard, which reports the failure
  * and retries the batch on the next cycle.
@@ -83,34 +85,55 @@ class HistoryBackfillWriter @Inject constructor(
     /**
      * Step 2: commit everything derived from a batch, atomically with the cursor that says so.
      *
-     * [fromExclusive] is the cursor's value before this batch and [throughInclusive] the batch's
-     * highest sequence number; together they are the window the batch covers, and the window the
-     * `processed` flags are set over.
+     * [sequenceNumbers] are the raw sequences this batch derived from -- exactly the rows whose
+     * `processed` flag this commit is entitled to set. They are listed rather than described as
+     * a range because a batch is whatever the driver handed over, which is not the same set as
+     * "everything above the old cursor": the Tandem driver paginates by pump record index and
+     * re-serves sequences below the cursor on a rescan. A range would both miss those (leaving
+     * them permanently unprocessed) and, on a batch the driver skipped ahead over, claim rows
+     * this transaction never derived.
+     *
+     * [throughInclusive] is where the cursor lands: the batch's highest sequence number.
      *
      * The sync rows are built before the transaction opens -- serializing events and reading the
      * encrypted token store are not things to do while holding the write lock -- but inserted
      * inside it, so a rolled-back batch cannot leave queued uploads for records that no longer
-     * exist.
+     * exist. They carry a dedupe key, so a batch that is legitimately re-processed does not
+     * queue a second upload for events already waiting to go out.
      */
     suspend fun commitDerivedBatch(
+        sequenceNumbers: List<Int>,
         cgmReadings: List<CgmReading>,
         bolusEvents: List<BolusEvent>,
         basalReadings: List<BasalReading>,
-        fromExclusive: Int,
         throughInclusive: Int,
         nowMs: Long = System.currentTimeMillis(),
     ) {
-        val queueRows = syncEnqueuer.buildBackfillRows(bolusEvents, basalReadings)
+        val queue = syncEnqueuer.buildBackfillRows(bolusEvents, basalReadings)
         db.withTransaction {
             // Same repository writes the live poll loops use, so the domain -> entity mapping
             // stays in one place; inside this block they join the batch's transaction.
             repository.saveCgmBatch(cgmReadings)
             repository.saveBoluses(bolusEvents)
             repository.saveBasalBatch(basalReadings)
-            if (queueRows.isNotEmpty()) {
-                syncDao.enqueueAll(queueRows)
+            if (queue.rows.isNotEmpty()) {
+                syncDao.enqueueAllIgnoringDuplicates(queue.rows)
             }
-            rawHistoryLogDao.markProcessedThrough(fromExclusive, throughInclusive)
+            if (queue.complete) {
+                sequenceNumbers.chunked(RawHistoryLogDao.MAX_SEQUENCES_PER_MARK)
+                    .forEach { rawHistoryLogDao.markProcessed(it) }
+            } else {
+                // The derived rows are committed and the cursor moves, because losing them over
+                // a failure to serialize an upload would be the worse trade. But these raw rows
+                // stay flagged: their uploads are missing, and the flag is what a re-derivation
+                // pass looks for. Marking them done here is how a batch's boluses and basal
+                // rates would go absent from the backend with nothing left recording it.
+                Timber.w(
+                    "Batch through %d committed without its upload rows; %d raw row(s) left for " +
+                        "re-derivation",
+                    throughInclusive, sequenceNumbers.size,
+                )
+            }
             // Seed-then-advance rather than an upsert: the update carries a `<` guard, so a
             // cursor that is already further along stays put instead of rewinding.
             cursorDao.seed(

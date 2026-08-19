@@ -39,10 +39,11 @@ import java.time.Instant
  *
  * Killing a process mid-batch is, at the persistence layer, indistinguishable from a
  * transaction that never commits: SQLite's journal is what makes a torn write impossible, and
- * an `adb shell am kill` can only land inside or outside a transaction. So "killed here" is
- * injected two ways -- abandoning the writer between its two steps, and aborting the batch
- * transaction at each of the four points inside it -- and every case is then re-opened from
- * the database FILE, so what the assertions see is what a restarted process would see.
+ * a kill can only land inside or outside a transaction. So "killed here" is injected two ways --
+ * abandoning the writer between its two steps, and aborting the batch transaction at each of the
+ * four points inside it -- and every case is then re-opened from the database FILE, so what the
+ * assertions see is what a restarted process would see. `BackfillProcessKillTest` does the same
+ * thing with a real process kill, against a real second process.
  *
  * Instrumented (needs real SQLite): run with
  * `ANDROID_SERIAL=emulator-5554 ./gradlew :app:connectedDebugAndroidTest`.
@@ -55,17 +56,25 @@ class HistoryBackfillWriterTest {
 
     private lateinit var db: AppDatabase
     private lateinit var writer: HistoryBackfillWriter
-    private lateinit var authTokenStore: AuthTokenStore
-    private var previousBaseUrl: String? = null
+
+    /**
+     * The enqueuer is mode-gated on a configured backend, and the queue rows are half of what the
+     * batch transaction has to keep consistent -- so answer the gate directly instead of writing
+     * a fake server address into the device's real credential store. The store this subclasses
+     * still reads the real encrypted prefs; it never writes them, so an aborted run cannot leave
+     * the installed app pointed somewhere it should not be.
+     */
+    private open class FakeAuthTokenStore(context: Context) : AuthTokenStore(context, Dispatchers.IO) {
+        override fun isBackendConfigured(): Boolean = true
+    }
+
+    /** A store whose mode gate is broken, e.g. a keystore flake. */
+    private class FailingAuthTokenStore(context: Context) : FakeAuthTokenStore(context) {
+        override fun isBackendConfigured(): Boolean = throw IllegalStateException("keystore flake")
+    }
 
     @Before
     fun setUp() {
-        authTokenStore = AuthTokenStore(context, Dispatchers.IO)
-        // The enqueuer is mode-gated on a configured backend, and the queue rows are half of
-        // what the batch transaction has to keep consistent -- so configure one, and put the
-        // real setting back afterwards.
-        previousBaseUrl = authTokenStore.getBaseUrl()
-        authTokenStore.saveBaseUrl(TEST_BASE_URL)
         context.deleteDatabase(TEST_DB)
         openDatabase()
     }
@@ -74,11 +83,9 @@ class HistoryBackfillWriterTest {
     fun tearDown() {
         db.close()
         context.deleteDatabase(TEST_DB)
-        val restored = previousBaseUrl
-        if (restored != null) authTokenStore.saveBaseUrl(restored) else authTokenStore.clearBaseUrl()
     }
 
-    private fun openDatabase() {
+    private fun openDatabase(authTokenStore: AuthTokenStore = FakeAuthTokenStore(context)) {
         db = Room.databaseBuilder(context, AppDatabase::class.java, TEST_DB).build()
         writer = HistoryBackfillWriter(
             db = db,
@@ -141,14 +148,14 @@ class HistoryBackfillWriterTest {
     )
 
     /** The whole batch, exactly as the poll loop runs it. */
-    private suspend fun runWholeBatch() {
-        writer.persistRawBatch(batchRecords)
+    private suspend fun runWholeBatch(records: List<HistoryLogRecord> = batchRecords) {
+        writer.persistRawBatch(records)
         writer.commitDerivedBatch(
+            sequenceNumbers = records.map { it.sequenceNumber },
             cgmReadings = batchCgm,
             bolusEvents = batchBoluses,
             basalReadings = batchBasal,
-            fromExclusive = ANCHOR,
-            throughInclusive = batchRecords.maxOf { it.sequenceNumber },
+            throughInclusive = records.maxOf { it.sequenceNumber },
         )
     }
 
@@ -160,6 +167,8 @@ class HistoryBackfillWriterTest {
         val basal: List<Pair<Float, Long>>,
         val queuedEvents: List<String>,
     )
+
+    private val emptySnapshot = DerivedSnapshot(emptyList(), emptyList(), emptyList(), emptyList())
 
     private fun snapshotDerived(): DerivedSnapshot = DerivedSnapshot(
         cgm = query("SELECT glucoseMgDl, timestampMs FROM cgm_readings ORDER BY timestampMs") {
@@ -185,8 +194,12 @@ class HistoryBackfillWriterTest {
         query("SELECT processedThroughSequence FROM history_backfill_cursor") { it.getInt(0) }
             .firstOrNull()
 
-    private fun processedFlags(): List<Int> =
-        query("SELECT processed FROM raw_history_logs ORDER BY sequenceNumber") { it.getInt(0) }
+    private fun processedBySequence(): List<Pair<Int, Int>> =
+        query("SELECT sequenceNumber, processed FROM raw_history_logs ORDER BY sequenceNumber") {
+            it.getInt(0) to it.getInt(1)
+        }
+
+    private fun processedFlags(): List<Int> = processedBySequence().map { it.second }
 
     /** Makes the next insert into [table] fail, the way a kill makes the rest of a batch fail. */
     private fun abortInsertsOn(table: String) {
@@ -236,7 +249,7 @@ class HistoryBackfillWriterTest {
         // ...and, decisively, the resume cursor did NOT move over them. The old anchor
         // (MAX(sequenceNumber) of the raw table) would already read ANCHOR + 3 here.
         assertNull(writer.processedThroughSequence())
-        assertEquals(DerivedSnapshot(emptyList(), emptyList(), emptyList(), emptyList()), snapshotDerived())
+        assertEquals(emptySnapshot, snapshotDerived())
 
         // The next run re-fetches the same batch and completes it.
         runWholeBatch()
@@ -257,10 +270,10 @@ class HistoryBackfillWriterTest {
 
             val failure = runCatching {
                 writer.commitDerivedBatch(
+                    sequenceNumbers = batchRecords.map { it.sequenceNumber },
                     cgmReadings = batchCgm,
                     bolusEvents = batchBoluses,
                     basalReadings = batchBasal,
-                    fromExclusive = ANCHOR,
                     throughInclusive = ANCHOR + 3,
                 )
             }.exceptionOrNull()
@@ -271,7 +284,7 @@ class HistoryBackfillWriterTest {
 
             assertEquals(
                 "aborting at $table must leave no derived rows behind",
-                DerivedSnapshot(emptyList(), emptyList(), emptyList(), emptyList()),
+                emptySnapshot,
                 snapshotDerived(),
             )
             assertNull("aborting at $table must not move the cursor", writer.processedThroughSequence())
@@ -296,7 +309,13 @@ class HistoryBackfillWriterTest {
         writer.persistRawBatch(batchRecords)
         abortInsertsOn("basal_readings")
         val failure = runCatching {
-            writer.commitDerivedBatch(batchCgm, batchBoluses, batchBasal, ANCHOR, ANCHOR + 3)
+            writer.commitDerivedBatch(
+                sequenceNumbers = batchRecords.map { it.sequenceNumber },
+                cgmReadings = batchCgm,
+                bolusEvents = batchBoluses,
+                basalReadings = batchBasal,
+                throughInclusive = ANCHOR + 3,
+            )
         }.exceptionOrNull()
         assertNotNull("the batch must fail when a derived write does", failure)
         stopAborting()
@@ -313,19 +332,97 @@ class HistoryBackfillWriterTest {
     }
 
     @Test
-    fun committingTheSameBatchTwiceDoesNotDuplicateDerivedRows() = runBlocking {
+    fun reCommittingABatchDuplicatesNothing_includingItsUploads() = runBlocking {
         runWholeBatch()
         val afterFirst = snapshotDerived()
 
-        // Belt and braces: the cursor already stops the poll loop re-offering a committed batch,
-        // so this is the sanity check that the derived tables would dedupe anyway.
+        // A committed batch CAN be re-offered: a commit that lands and then throws
+        // CancellationException on the way out leaves the in-memory anchor behind, and a
+        // progressive driver rescan re-serves the same records after a reconnect. The derived
+        // tables collapse on their unique indices; the queue used to be the one table that did
+        // not, so the replay queued -- and uploaded -- every bolus and basal rate twice.
         runWholeBatch()
 
-        val afterSecond = snapshotDerived()
-        assertEquals(afterFirst.cgm, afterSecond.cgm)
-        assertEquals(afterFirst.boluses, afterSecond.boluses)
-        assertEquals(afterFirst.basal, afterSecond.basal)
+        assertEquals(afterFirst, snapshotDerived())
+        assertEquals(2, query("SELECT id FROM sync_queue") { it.getLong(0) }.size)
         assertEquals(3, query("SELECT id FROM raw_history_logs") { it.getLong(0) }.size)
+    }
+
+    @Test
+    fun aDeliveredUploadDoesNotBlockTheSameEventBeingQueuedAgainLater() = runBlocking {
+        runWholeBatch()
+        // The queue processor deletes rows once they are uploaded; the dedupe key must not
+        // become a permanent tombstone that silently swallows a genuinely new enqueue.
+        db.openHelper.writableDatabase.execSQL("DELETE FROM sync_queue")
+
+        runWholeBatch()
+
+        assertEquals(cleanRunSnapshot().queuedEvents, snapshotDerived().queuedEvents)
+    }
+
+    @Test
+    fun onlyTheBatchesOwnSequencesAreMarkedProcessed() = runBlocking {
+        // A batch that straddles the cursor: the Tandem driver paginates by pump record index,
+        // so a rescan after a reconnect re-serves sequences BELOW the cursor alongside new ones.
+        // Marking a range above the cursor left those rows unprocessed forever, which is a flag
+        // that does not mean what a re-derivation pass reads it as.
+        val straddling = listOf(ANCHOR - 20, ANCHOR - 10, ANCHOR + 1, ANCHOR + 2).map { seq ->
+            HistoryLogRecord(
+                sequenceNumber = seq,
+                rawBytesB64 = "cmF3JGk=",
+                eventTypeId = 399,
+                pumpTimeSeconds = 572_000_000L + seq,
+            )
+        }
+        // A raw row this batch did NOT derive from, sitting inside the same numeric range.
+        writer.persistRawBatch(
+            listOf(
+                HistoryLogRecord(
+                    sequenceNumber = ANCHOR - 15,
+                    rawBytesB64 = "b3RoZXI=",
+                    eventTypeId = 399,
+                    pumpTimeSeconds = 572_000_100L,
+                ),
+            ),
+        )
+
+        runWholeBatch(straddling)
+        restartProcess()
+
+        assertEquals(
+            listOf(
+                ANCHOR - 20 to 1,
+                // Not part of the batch: a range-based UPDATE would have claimed this one.
+                ANCHOR - 15 to 0,
+                ANCHOR - 10 to 1,
+                ANCHOR + 1 to 1,
+                ANCHOR + 2 to 1,
+            ),
+            processedBySequence(),
+        )
+        assertEquals(ANCHOR + 2, writer.processedThroughSequence())
+    }
+
+    @Test
+    fun aBatchThatCannotBuildItsUploadsCommitsButStaysFlaggedForReDerivation() = runBlocking {
+        db.close()
+        openDatabase(FailingAuthTokenStore(context))
+
+        runWholeBatch()
+        restartProcess()
+
+        // The derived records are kept -- losing a batch of CGM/bolus/basal over a failure to
+        // serialize an upload would be the worse trade -- and the cursor moves with them.
+        val derived = snapshotDerived()
+        assertEquals(3, derived.cgm.size)
+        assertEquals(1, derived.boluses.size)
+        assertEquals(1, derived.basal.size)
+        assertEquals(ANCHOR + 3, writer.processedThroughSequence())
+        // But the uploads are missing, so the raw rows stay findable. Marking them done here is
+        // how a batch's boluses go permanently absent from the backend with nothing recording it.
+        assertTrue("no queue rows were built", derived.queuedEvents.isEmpty())
+        assertEquals(listOf(0, 0, 0), processedFlags())
+        assertEquals(3, db.rawHistoryLogDao().countUnprocessed())
     }
 
     @Test
@@ -336,10 +433,10 @@ class HistoryBackfillWriterTest {
         // A stale caller replaying an earlier window must not drag the anchor backwards --
         // that would re-download history the pump has already handed over.
         writer.commitDerivedBatch(
+            sequenceNumbers = emptyList(),
             cgmReadings = emptyList(),
             bolusEvents = emptyList(),
             basalReadings = emptyList(),
-            fromExclusive = ANCHOR - 100,
             throughInclusive = ANCHOR,
         )
 
@@ -351,15 +448,16 @@ class HistoryBackfillWriterTest {
         // A window the pump answered with nothing derivable is still a window that has been
         // processed; leaving the cursor behind would re-fetch it forever.
         writer.commitDerivedBatch(
+            sequenceNumbers = emptyList(),
             cgmReadings = emptyList(),
             bolusEvents = emptyList(),
             basalReadings = emptyList(),
-            fromExclusive = ANCHOR,
             throughInclusive = ANCHOR + 3,
         )
         restartProcess()
 
         assertEquals(ANCHOR + 3, writer.processedThroughSequence())
+        assertEquals(ANCHOR + 3, storedCursor())
         assertTrue(snapshotDerived().queuedEvents.isEmpty())
     }
 
@@ -378,7 +476,6 @@ class HistoryBackfillWriterTest {
 
     private companion object {
         const val TEST_DB = "history-backfill-writer-test"
-        const val TEST_BASE_URL = "https://backfill.test.invalid"
         const val ABORT_TRIGGER = "gly250_simulated_kill"
         const val ANCHOR = 500
         const val BASE_TIME_MS = 1_700_000_000_000L

@@ -86,12 +86,6 @@ class PumpPollingOrchestrator @Inject constructor(
     @Volatile
     private var lastSequenceNumber: Int = 0
 
-    /** Whether [lastSequenceNumber] has been resolved from Room this process. Until it has,
-     *  [lastSequenceNumber] is not a resume anchor, just its zero default — see
-     *  [readSequenceAnchor]. */
-    @Volatile
-    private var sequenceAnchorRestored: Boolean = false
-
     /** Whether hardware info has been cached this session. */
     @Volatile
     private var hardwareInfoCached: Boolean = false
@@ -134,25 +128,12 @@ class PumpPollingOrchestrator @Inject constructor(
         stop() // cancel any previous jobs
         synchronized(lock) {
             connectionWatcherJob = scope.launch {
-                // Restore last known sequence number from Room to avoid re-downloading.
-                // Guarded (GLY-249): this read used to run bare, so a Room/SQLCipher failure here
-                // killed the watcher before it ever observed a connection state — no loops, no
-                // polling, no telemetry, for the life of the service. The slow loop retries it.
-                try {
-                    readSequenceAnchor()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    // Exception class only at ERROR, throwable at DEBUG — same discipline as
-                    // [runStep]: this is a Room/SQLCipher failure, and its message can quote the
-                    // failing statement or row, which is history-log data.
-                    Timber.e(
-                        "Failed to read the history resume anchor (%s); the slow loop will retry",
-                        e.javaClass.simpleName,
-                    )
-                    Timber.d(e, "History resume anchor read failure detail")
-                }
-
+                // No Room read here at all any more. The watcher used to restore the resume
+                // anchor before observing anything, which meant a Room/SQLCipher failure could
+                // kill it outright — no loops, no polling, no telemetry, for the life of the
+                // service (GLY-249 guarded that; GLY-250 removes the need for it). The anchor is
+                // now read at the top of every history poll instead, where a failure costs one
+                // backfill cycle and reports on the step guard.
                 pumpDriver.observeConnectionState().collectLatest { state ->
                     if (state == ConnectionState.CONNECTED) {
                         val isReconnection = hasBeenConnectedBefore
@@ -248,11 +229,12 @@ class PumpPollingOrchestrator @Inject constructor(
      * anchoring on it resumed above records that were never derived and lost them for good.
      * A null cursor is a fresh install; anything else throws and stays distinguishable from one.
      *
-     * Throws whatever Room throws; both callers decide what that means for them.
+     * Throws whatever Room throws, deliberately: the caller lets it reach [runStep], which
+     * reports it and retries next cycle. Degrading a transient database error to anchor 0 would
+     * re-download the pump's entire history behind the user's back (GLY-249).
      */
     private suspend fun readSequenceAnchor() {
         lastSequenceNumber = historyBackfill.processedThroughSequence() ?: 0
-        sequenceAnchorRestored = true
     }
 
     private fun effectiveInterval(baseMs: Long): Long =
@@ -826,13 +808,26 @@ class PumpPollingOrchestrator @Inject constructor(
      * batch rather than skipping past it. That is the deliberate trade: a stall freezes the slow
      * loop's heartbeat and reports on the failure ladder, where skipping was silent and
      * permanent.
+     *
+     * The durable cursor is the ONLY progress marker, and everything else is subordinate to it:
+     * it is re-read at the top of every cycle, and the driver's own scan position moves only
+     * when this loop acknowledges a batch. A driver that advanced its position at fetch time
+     * would skip a batch outright the moment a BLE flap cancelled the loop in between — see
+     * [PumpDriver.acknowledgeHistoryLogs].
      */
     private suspend fun pollHistoryLogs() {
-        // Retry a resume anchor the connection watcher could not read. Deliberately unguarded: a
-        // still-broken DB throws into [runStep], which reports it as (slow, history_logs) and
-        // retries next cycle — far better than backfilling from a bogus anchor of 0, which would
-        // re-download the pump's entire history behind the user's back.
-        if (!sequenceAnchorRestored) readSequenceAnchor()
+        // Re-read the durable cursor EVERY cycle, not just when the watcher's read failed. The
+        // in-memory mirror can lag it: `commitDerivedBatch` can commit and then still throw
+        // `CancellationException` on the way out (`withTransaction` resumes through
+        // `withContext`, which checks cancellation after the block has run), and the connection
+        // watcher cancels the poll loops on every non-CONNECTED emission — the BLE flap this
+        // epic exists for. A lagging mirror re-fetches an already-committed batch; re-reading
+        // one indexed single-row value per five-minute cycle removes the lag at the source.
+        //
+        // Deliberately unguarded: a broken DB throws into [runStep], which reports it as
+        // (slow, history_logs) and retries next cycle — far better than backfilling from a bogus
+        // anchor of 0, which would re-download the pump's entire history behind the user's back.
+        readSequenceAnchor()
 
         val limits = safetyLimitsStore.toSafetyLimits()
         if (safetyLimitsStore.isStale()) {
@@ -866,6 +861,9 @@ class PumpPollingOrchestrator @Inject constructor(
             val records = result.getOrNull() ?: break
 
             if (records.isEmpty()) {
+                // Nothing to persist, so the driver's scan position over an empty answer is
+                // durably accounted for by definition.
+                pumpDriver.acknowledgeHistoryLogs()
                 if (batchCount > 0) {
                     if (isInitialSync) {
                         Timber.i("Initial pump history sync complete")
@@ -881,7 +879,13 @@ class PumpPollingOrchestrator @Inject constructor(
 
             val batchMaxSeq = records.maxOfOrNull { it.sequenceNumber } ?: lastSequenceNumber
             if (batchMaxSeq <= lastSequenceNumber) {
-                Timber.w("History sequence not advancing (batch %d, stuck at %d), breaking", batchCount, lastSequenceNumber)
+                // Every record in this batch is at or below the cursor, so all of them are
+                // already committed — the driver rescanning old indices, which is normal after a
+                // reconnect. Acknowledging lets its scan position move past them; without that
+                // it would re-serve the same window forever and the backfill would never reach
+                // the records that ARE new.
+                pumpDriver.acknowledgeHistoryLogs()
+                Timber.d("History batch %d is at or below the cursor (%d), advancing the scan past it", batchCount, lastSequenceNumber)
                 break
             }
 
@@ -901,15 +905,21 @@ class PumpPollingOrchestrator @Inject constructor(
             // flags + the resume cursor. All of it lands or none of it does, so a process death
             // anywhere in this batch costs a re-fetch, never a record.
             historyBackfill.commitDerivedBatch(
+                sequenceNumbers = records.map { it.sequenceNumber },
                 cgmReadings = cgmReadings,
                 bolusEvents = bolusEvents,
                 basalReadings = basalReadings,
-                fromExclusive = lastSequenceNumber,
                 throughInclusive = batchMaxSeq,
             )
 
-            // Only now, past the commit, may the in-memory cursor move: it is the anchor the next
-            // fetch resumes from, and it must never run ahead of what is durable.
+            // Past the commit, and only now: tell the driver it may move whatever scan position
+            // it keeps. Anything that cancels the loop before this point leaves that position
+            // behind, so the batch is re-served rather than skipped — which is the whole reason
+            // the fetch does not advance it itself.
+            pumpDriver.acknowledgeHistoryLogs()
+
+            // Same for the in-memory cursor: it is the anchor the next fetch resumes from, and
+            // it must never run ahead of what is durable.
             lastSequenceNumber = batchMaxSeq
             totalCgm += cgmReadings.size
             totalBolus += bolusEvents.size

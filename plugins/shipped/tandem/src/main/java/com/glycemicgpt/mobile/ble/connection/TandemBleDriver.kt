@@ -42,11 +42,22 @@ class TandemBleDriver @Inject constructor(
     private val debugLogger: DebugLogger,
 ) : PumpDriver {
 
-    /** Progressive scan position for history log fetching (pump record INDEX).
-     *  Persists across poll cycles so each cycle continues where the last left off.
-     *  Reset to 0 when the pump's index range shifts beyond the lookback window. */
+    /** ACKNOWLEDGED progressive scan position for history log fetching (pump record INDEX):
+     *  the index the next fetch resumes from. Persists across poll cycles so each cycle
+     *  continues where the last left off. Reset to 0 when the pump's index range shifts beyond
+     *  the lookback window.
+     *
+     *  Only [acknowledgeHistoryLogs] moves it. Moving it at fetch time -- which is what this
+     *  driver used to do -- meant a BLE flap between the fetch and the caller's commit resumed
+     *  the next scan ABOVE a batch that was never persisted, losing it for good (GLY-250). */
     @Volatile
     private var nextHistoryIndex: Int = 0
+
+    /** Where the last fetch got to, held back until the caller says the batch is durable. Null
+     *  when there is nothing outstanding. A fetch whose records never get acknowledged simply
+     *  leaves this stale, and the next fetch overwrites it. */
+    @Volatile
+    private var pendingHistoryIndex: Int? = null
 
     /** Cached activity mode from ControlIQInfoV1 to avoid an extra BLE round-trip
      *  on every poll cycle. Refreshed every [ACTIVITY_MODE_REFRESH_CYCLES] calls. */
@@ -243,8 +254,37 @@ class TandemBleDriver @Inject constructor(
 
             // Parse each FFF8 packet individually (each has its own header + records).
             // Dedup is handled by IGNORE strategy on insert (unique timestampMs index).
-            val records = fff8Packets.flatMap { packet ->
-                StatusResponseParser.parseHistoryLogStreamCargo(packet)
+            //
+            // An undecodable packet FOLLOWED by decodable ones is a hole in the middle of the
+            // batch, and the whole batch is thrown away rather than handed over with the hole in
+            // it: the caller's cursor advances to max(sequenceNumber) of what we return, so an
+            // interior gap is stepped over permanently AND its raw bytes are never stored
+            // (GLY-250, the contiguity contract on PumpDriver.getHistoryLogs). currentIndex
+            // stays put, so the same window is re-requested next cycle -- a persistently
+            // undecodable record stalls the backfill loudly instead of skipping it silently.
+            // Trailing empty packets are just the end of the stream and keep their old meaning.
+            val records = mutableListOf<HistoryLogRecord>()
+            var sawEmptyPacket = false
+            var interiorGap = false
+            for (packet in fff8Packets) {
+                val parsed = StatusResponseParser.parseHistoryLogStreamCargo(packet)
+                if (parsed.isEmpty()) {
+                    sawEmptyPacket = true
+                    continue
+                }
+                if (sawEmptyPacket) {
+                    interiorGap = true
+                    break
+                }
+                records.addAll(parsed)
+            }
+            if (interiorGap) {
+                Timber.w(
+                    "Undecodable FFF8 packet inside the batch at index=%d; dropping the whole " +
+                        "batch (%d record(s)) and retrying the window next cycle",
+                    currentIndex, records.size,
+                )
+                break
             }
             if (records.isEmpty()) {
                 Timber.d("No records parsed from %d FFF8 packets at index=%d",
@@ -257,10 +297,31 @@ class TandemBleDriver @Inject constructor(
             delay(HISTORY_BATCH_STAGGER_MS)
         }
 
-        // Save progress for next poll cycle (progressive scanning).
-        nextHistoryIndex = currentIndex
-        Timber.d("Fetched %d history log records (fetchStart=%d nextIndex=%d)", allRecords.size, fetchStart, currentIndex)
+        // Scan progress is only PROPOSED here. It becomes the resume point in
+        // [acknowledgeHistoryLogs], once the caller has these records on disk.
+        pendingHistoryIndex = currentIndex
+        Timber.d(
+            "Fetched %d history log records (fetchStart=%d pendingIndex=%d ackedIndex=%d)",
+            allRecords.size, fetchStart, currentIndex, nextHistoryIndex,
+        )
         return Result.success(allRecords)
+    }
+
+    /**
+     * Promotes the last fetch's scan position now that the caller has committed those records.
+     *
+     * Everything before this point is re-servable: if the poll loop is cancelled mid-batch (a
+     * BLE flap does that on every non-CONNECTED state), the position stays where it was and the
+     * next scan hands the same records over again, which the caller's inserts dedupe away.
+     */
+    override suspend fun acknowledgeHistoryLogs() {
+        val pending = pendingHistoryIndex ?: return
+        pendingHistoryIndex = null
+        // Assigned, not max()'d: the fetch this acknowledges either resumed from the current
+        // position or deliberately restarted at the window start (a pump whose index range
+        // shifted or reset), and in the second case the lower value is the correct one.
+        nextHistoryIndex = pending
+        Timber.d("History scan position acknowledged: nextIndex=%d", pending)
     }
 
     override suspend fun getPumpHardwareInfo(): Result<PumpHardwareInfo> {
