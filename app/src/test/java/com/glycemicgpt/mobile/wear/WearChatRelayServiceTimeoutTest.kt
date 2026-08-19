@@ -108,9 +108,9 @@ class WearChatRelayServiceTimeoutTest {
     @Test
     fun `a start command landing mid-request leaves the in-flight relay promoted`() {
         // GMS keeps the service bound while a chat request is being handled, so stopSelf does not
-        // destroy it -- but a start command that promoted and demoted unconditionally would drop
-        // the foreground state out from under the request. The work counter is what prevents that:
-        // the relay is already promoted, so this start neither re-promotes nor demotes.
+        // destroy it -- but a start command that demoted unconditionally would drop the foreground
+        // state out from under the request. The work counter is what prevents that: the demotion
+        // is gated on it, so this start leaves the relay promoted with its counter untouched.
         mockkObject(ForegroundServiceStarter)
         every {
             ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
@@ -121,9 +121,85 @@ class WearChatRelayServiceTimeoutTest {
 
         assertEquals(1, service.activeWorkCount.get())
         assertFalse(shadowOf(service).isForegroundStopped)
-        verify(exactly = 1) {
+    }
+
+    @Test
+    fun `a start command promotes even when a request is already counted`() {
+        // The hole a counter-gated promotion leaves. activeWorkCount counts work items, not
+        // foreground state, and a refused promotion pulls the two apart: the request below is
+        // counted but the service never reached the foreground. If the start command trusted the
+        // counter it would skip startForeground entirely and the platform would kill the process
+        // ~30s later, which is the exact crash this override exists to prevent. Promoting
+        // unconditionally is free -- startForeground on an already-foreground service refreshes
+        // the same notification id.
+        mockkObject(ForegroundServiceStarter)
+        every {
+            ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
+        } returns ForegroundServiceStartResult.Rejected(
+            FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
+            "IllegalStateException",
+            ForegroundStartRejectionReason.BUDGET_EXHAUSTED,
+        )
+        service.startWork()
+
+        service.onStartCommand(Intent(), 0, START_ID)
+
+        verify(exactly = 2) {
             ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
         }
+        // Still no demotion out from under the request that is running unprotected.
+        assertEquals(1, service.activeWorkCount.get())
+        assertFalse(shadowOf(service).isForegroundStopped)
+    }
+
+    @Test
+    fun `a work item on another thread cannot interleave with a start command`() {
+        // Watch messages arrive on GMS binder threads; start commands arrive on the main thread.
+        // Both mutate activeWorkCount and then act on the foreground state, and the counter being
+        // an AtomicInteger does not make the pair atomic: a startWork landing between a decrement
+        // and its clamp is promoted and then immediately demoted by the finishing caller, leaving
+        // a 20-60s chat request with no foreground protection. The lock is what makes each
+        // counter mutation and the foreground transition it decides one step.
+        val insidePromotion = CountDownLatch(1)
+        val releasePromotion = CountDownLatch(1)
+        val workStarted = CountDownLatch(1)
+        mockkObject(ForegroundServiceStarter)
+        every {
+            ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
+        } answers {
+            insidePromotion.countDown()
+            releasePromotion.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            ForegroundServiceStartResult.Started
+        }
+
+        val startCommand = Thread { service.onStartCommand(Intent(), 0, START_ID) }
+        startCommand.start()
+        assertTrue(
+            "the start command never reached its promotion",
+            insidePromotion.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+
+        val watchMessage = Thread {
+            service.startWork()
+            workStarted.countDown()
+        }
+        watchMessage.start()
+
+        assertFalse(
+            "a watch message mutated the work counter while the start command was mid-promotion",
+            workStarted.await(CONTENDED_WAIT_MILLIS, TimeUnit.MILLISECONDS),
+        )
+        assertEquals(0, service.activeWorkCount.get())
+
+        releasePromotion.countDown()
+        startCommand.join(JOIN_TIMEOUT_MILLIS)
+        watchMessage.join(JOIN_TIMEOUT_MILLIS)
+
+        assertTrue(
+            "the watch message never got the lock back",
+            workStarted.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+        assertEquals(1, service.activeWorkCount.get())
     }
 
     @Test
@@ -181,5 +257,9 @@ class WearChatRelayServiceTimeoutTest {
     private companion object {
         const val START_ID = 3
         const val LATCH_TIMEOUT_SECONDS = 5L
+
+        /** How long a blocked-on-the-lock thread is given to prove it is actually blocked. */
+        const val CONTENDED_WAIT_MILLIS = 500L
+        const val JOIN_TIMEOUT_MILLIS = 5_000L
     }
 }

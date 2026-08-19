@@ -166,6 +166,31 @@ class MonitoringReconcilerTest {
     }
 
     @Test
+    fun `a refusal on top of a service that is demonstrably up is not a failed start`() {
+        // The tail of the race the isRunning() probe above loses: the service came up between that
+        // probe and this start, so the platform refused a redundant start while the component was
+        // alive. ForegroundServiceStarter records nothing for that case; calling it START_REJECTED
+        // here would still set monitoringOff and warn that monitoring is not running, about a
+        // service that is.
+        every { PumpConnectionService.start(any()) } returns ForegroundServiceStartResult.Rejected(
+            FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+            "ForegroundServiceStartNotAllowedException",
+            ForegroundStartRejectionReason.BACKGROUND_START_RESTRICTION,
+            componentStillRunning = true,
+        )
+
+        val decision = reconciler.reconcile(MonitoringReconcileTrigger.APP_FOREGROUNDED)
+
+        assertEquals(MonitoringReconcileDecision.ALREADY_RUNNING, decision)
+        val line = logs.single { it.second.startsWith(MonitoringReconciler.RECONCILE_EVENT_TAG) }
+        assertEquals(
+            "a start refused on top of a live service is not a breadcrumb",
+            android.util.Log.INFO,
+            line.first,
+        )
+    }
+
+    @Test
     fun `every reconcile reports its trigger and decision, and nothing else`() {
         reconciler.reconcile(MonitoringReconcileTrigger.APP_FOREGROUNDED)
 

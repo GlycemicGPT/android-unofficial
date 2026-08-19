@@ -61,6 +61,19 @@ class WearChatRelayService : WearableListenerService() {
     internal val activeWorkCount = AtomicInteger(0)
 
     /**
+     * Serialises each counter mutation with the foreground transition it decides -- the same lock
+     * the watch-side receivers hold around their own push counter.
+     *
+     * [finishWork]'s decrement-then-clamp is two operations on an atomic, not one atomic
+     * operation, and the work items are not on one thread: watch messages land on GMS binder
+     * threads while [onStartCommand] runs on the main thread. A [startWork] that interleaves
+     * between the decrement and the `set(0)` promotes and is then clamped straight back to zero
+     * and demoted by the finishing caller, so a 20-60 s chat request runs on with no foreground
+     * protection and the process is killable for the whole of it.
+     */
+    private val foregroundLock = Any()
+
+    /**
      * A `startService`/`startForegroundService` delivery, which for this service always carries
      * nothing to do: watch messages arrive over the GMS binding and land in [onMessageReceived],
      * which does its own foreground promotion around the work it starts.
@@ -76,11 +89,24 @@ class WearChatRelayService : WearableListenerService() {
      * background wake-up paths, at 31 s and 1.5 s of process age respectively.
      *
      * So the obligation is discharged the only way that is not fatal: promote, then drop straight
-     * back out. [startWork]/[finishWork] already do exactly that pair, including the case that
-     * makes a naive promote-and-demote wrong -- a chat request in flight has promoted already, and
-     * the counter keeps this start command from demoting out from under it. A promotion the
-     * platform refuses is fine too: the attempt is what clears the obligation, which is why
-     * [ForegroundServiceStarter] catching the rejection leaves nothing owed.
+     * back out if nothing else is holding the promotion.
+     *
+     * The promotion is unconditional here, unlike [startWork]'s, which fires only on the 0 -> 1
+     * transition. [activeWorkCount] counts work items, not foreground state, and the two come
+     * apart as soon as a promotion is refused: a chat request whose promote returned
+     * [ForegroundServiceStartResult.Rejected] leaves the counter at 1 with the service still in
+     * the background, and a counter-gated start command would then skip the one call that
+     * discharges the obligation -- straight back to the
+     * `ForegroundServiceDidNotStartInTimeException` this override exists to prevent. Calling
+     * `startForeground` on a service that is already foreground is harmless (it refreshes the
+     * same notification id), so promoting every time costs nothing and needs no second flag to
+     * track. The *demotion* stays counter-gated, which is what keeps this start command from
+     * dropping the foreground state out from under a relay already under way.
+     *
+     * A promotion the platform refuses leaves the obligation outstanding with nothing the app can
+     * do about it -- there is no second way to answer a start command -- but the refusal is at
+     * least survived rather than thrown, and the notification-free relay degrades the way
+     * [startWork]'s Rejected branch describes.
      *
      * The cost is a silent notification posted and removed within a millisecond, and a sliver of
      * the shared `dataSync` budget. `stopSelf` is safe once the promotion is discharged, and does
@@ -89,8 +115,12 @@ class WearChatRelayService : WearableListenerService() {
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        startWork()
-        finishWork()
+        synchronized(foregroundLock) {
+            promoteToForeground()
+            if (activeWorkCount.get() == 0) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+        }
         stopSelf(startId)
         return START_NOT_STICKY
     }
@@ -225,41 +255,50 @@ class WearChatRelayService : WearableListenerService() {
      */
     @VisibleForTesting
     internal fun startWork() {
-        if (activeWorkCount.getAndIncrement() == 0) {
-            ensureNotificationChannel()
-            val notification = buildNotification()
-            val foregroundServiceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            } else {
-                null
-            }
-            val result = ForegroundServiceStarter.promote(
-                this,
-                NOTIFICATION_ID,
-                notification,
-                FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
-                fgsTimeoutReporter,
-                foregroundServiceType,
-            )
-            when (result) {
-                ForegroundServiceStartResult.Started -> Timber.d("Chat relay promoted to foreground")
-                is ForegroundServiceStartResult.Rejected -> {
-                    // Android 15 refuses a dataSync promotion once the shared 24 h budget is spent
-                    // (ForegroundServiceStartNotAllowedException, an IllegalStateException). An
-                    // uncaught throw here would crash the process and take the pump connection with
-                    // it, over a watch chat message. Relay the request unprotected instead -- the
-                    // same trade the watch-side receivers already make.
-                }
+        synchronized(foregroundLock) {
+            if (activeWorkCount.getAndIncrement() == 0) {
+                promoteToForeground()
             }
         }
     }
 
     /** Demote from foreground when all work items complete. */
     private fun finishWork() {
-        if (activeWorkCount.decrementAndGet() <= 0) {
-            activeWorkCount.set(0) // clamp to 0
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            Timber.d("Chat relay returned to background")
+        synchronized(foregroundLock) {
+            if (activeWorkCount.decrementAndGet() <= 0) {
+                activeWorkCount.set(0) // clamp to 0
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                Timber.d("Chat relay returned to background")
+            }
+        }
+    }
+
+    /** Callers hold [foregroundLock]. */
+    private fun promoteToForeground() {
+        ensureNotificationChannel()
+        val notification = buildNotification()
+        val foregroundServiceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        } else {
+            null
+        }
+        val result = ForegroundServiceStarter.promote(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,
+            fgsTimeoutReporter,
+            foregroundServiceType,
+        )
+        when (result) {
+            ForegroundServiceStartResult.Started -> Timber.d("Chat relay promoted to foreground")
+            is ForegroundServiceStartResult.Rejected -> {
+                // Android 15 refuses a dataSync promotion once the shared 24 h budget is spent
+                // (ForegroundServiceStartNotAllowedException, an IllegalStateException). An
+                // uncaught throw here would crash the process and take the pump connection with
+                // it, over a watch chat message. Relay the request unprotected instead -- the
+                // same trade the watch-side receivers already make.
+            }
         }
     }
 
@@ -324,12 +363,14 @@ class WearChatRelayService : WearableListenerService() {
      */
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     override fun onTimeout(startId: Int, fgsType: Int) {
-        activeWorkCount.set(0)
         // cancelChildren, not cancel(): GMS keeps a WearableListenerService bound, so stopSelf
         // need not destroy this instance and the next watch message can land on it. Cancelling
         // the scope itself would leave it permanently dead.
         serviceScope.coroutineContext.cancelChildren()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        synchronized(foregroundLock) {
+            activeWorkCount.set(0)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
         stopSelf()
         fgsTimeoutReporter.recordTimeout(
             component = FgsTimeoutReporter.COMPONENT_WEAR_CHAT_RELAY,

@@ -189,6 +189,36 @@ class DataSyncTimeoutCoverageTest {
         }
     }
 
+    @Test
+    fun `the watch start commands promote without consulting the push counter`() {
+        val wear = modules.single { it.name == ":wear-device" }
+
+        WATCH_PUSH_SERVICES.forEach { className ->
+            val source = requireNotNull(sourceFileFor(wear, className)) {
+                "$className moved; update this guard"
+            }.readText()
+            val body = requireNotNull(START_COMMAND_BODY.find(source)?.groupValues?.get(1)) {
+                "$className: could not read the onStartCommand body; update this guard"
+            }
+
+            assertTrue(
+                "$className: onStartCommand must call tryPromoteToForeground",
+                body.contains("tryPromoteToForeground()"),
+            )
+            // activePushCount counts transfers, not foreground state. A transfer whose promotion
+            // the platform refused leaves the counter at 1 with the service in the background, so
+            // a counter-gated start command skips the startForeground that answers the platform
+            // and the process is killed ~30s later with ForegroundServiceDidNotStartInTimeException
+            // (GLY-247). Promoting every time is free: startForeground on an already-foreground
+            // service refreshes the same notification id.
+            assertFalse(
+                "$className: onStartCommand gates its promotion on the push counter again -- a " +
+                    "transfer whose promotion was refused then costs the process",
+                body.contains("getAndIncrement"),
+            )
+        }
+    }
+
     private data class ServiceTag(val className: String, val foregroundServiceType: String?)
 
     private fun dataSyncServices(module: Module): List<String> =
@@ -229,6 +259,12 @@ class DataSyncTimeoutCoverageTest {
         val FGS_TYPE_ATTR = Regex("android:foregroundServiceType\\s*=\\s*\"([^\"]+)\"")
         val ON_TIMEOUT = Regex("override\\s+fun\\s+onTimeout\\s*\\(\\s*\\w+\\s*:\\s*Int\\s*,")
         val ON_START_COMMAND = Regex("override\\s+fun\\s+onStartCommand\\s*\\(")
+
+        /** The override's body, up to the closing brace at method indentation. */
+        val START_COMMAND_BODY = Regex(
+            "override\\s+fun\\s+onStartCommand\\s*\\([^)]*\\)\\s*:\\s*Int\\s*\\{(.*?)\\n {4}\\}",
+            RegexOption.DOT_MATCHES_ALL,
+        )
 
         val WATCH_PUSH_SERVICES = listOf(
             "com.glycemicgpt.weardevice.push.WatchFaceReceiveService",

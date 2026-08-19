@@ -75,10 +75,18 @@ class MonitoringReconciler @Inject constructor(
         // Rejections are caught, classified, durably recorded and surfaced to the user inside
         // PumpConnectionService.start/ForegroundServiceStarter -- this only needs the verdict.
         val result = PumpConnectionService.start(context)
-        return if (result is ForegroundServiceStartResult.Rejected) {
-            MonitoringReconcileDecision.START_REJECTED
-        } else {
-            MonitoringReconcileDecision.STARTED
+        return when {
+            // A refusal with the service demonstrably alive is the tail of the race the
+            // isPumpConnectionRunning() check above loses: the service came up between that probe
+            // and this start, and the platform refused the redundant start on top of it.
+            // ForegroundServiceStarter records nothing for that case for the same reason -- calling
+            // it START_REJECTED here would set monitoringOff and warn that monitoring is not
+            // running, about a service that is.
+            result is ForegroundServiceStartResult.Rejected && result.componentStillRunning ->
+                MonitoringReconcileDecision.ALREADY_RUNNING
+            result is ForegroundServiceStartResult.Rejected ->
+                MonitoringReconcileDecision.START_REJECTED
+            else -> MonitoringReconcileDecision.STARTED
         }
     }
 

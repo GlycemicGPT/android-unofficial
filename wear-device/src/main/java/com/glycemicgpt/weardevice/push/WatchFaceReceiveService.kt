@@ -86,19 +86,24 @@ class WatchFaceReceiveService : WearableListenerService() {
      * twin of this service (`WearChatRelayService`) on an Android 16 emulator.
      *
      * So the obligation is discharged the only way that is not fatal: promote, then drop straight
-     * back out, under the same [foregroundLock]/[activePushCount] bookkeeping a real push uses --
-     * which is what keeps this start command from demoting out from under a transfer already
+     * back out if no transfer is holding the promotion -- under the same [foregroundLock] a real
+     * push takes, which is what keeps this start command from demoting out from under one already
      * under way. `stopSelf` is safe once the promotion is discharged, and does not destroy the
      * service while GMS holds its binding.
+     *
+     * The promotion is unconditional, unlike [onChannelOpened]'s, which fires on the 0 -> 1
+     * transition. [activePushCount] counts transfers, not foreground state, and the two come apart
+     * as soon as a promotion is refused: a transfer whose [tryPromoteToForeground] was rejected
+     * leaves the counter at 1 with the service still in the background, and a counter-gated start
+     * command would then skip the one call that discharges the obligation. `startForeground` on a
+     * service that is already foreground just refreshes the same notification id, so promoting
+     * every time costs nothing.
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         synchronized(foregroundLock) {
-            if (activePushCount.getAndIncrement() == 0) {
-                tryPromoteToForeground()
-            }
-            if (activePushCount.decrementAndGet() <= 0) {
-                activePushCount.set(0)
+            tryPromoteToForeground()
+            if (activePushCount.get() == 0) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
             }
         }
