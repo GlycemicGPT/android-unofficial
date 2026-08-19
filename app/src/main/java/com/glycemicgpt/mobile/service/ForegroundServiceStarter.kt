@@ -41,9 +41,10 @@ object ForegroundServiceStarter {
      * Companion-function call sites: `Context.startForegroundService`, before the service exists.
      *
      * [isComponentRunning] tells a rejection that means "monitoring is off" apart from one that
-     * means nothing at all (PR #44 review). Every redundant `start()` -- `GlycemicGptApp.onCreate`,
-     * `AuthRepository`, the Settings ViewModel -- re-issues this call while the target service may
-     * already be alive and healthy, and the platform can refuse it. A refused start never delivers
+     * means nothing at all (PR #44 review). Every redundant `start()` -- `AuthRepository`, the
+     * Settings ViewModel, a reconcile that raced the service's own startup -- re-issues this call
+     * while the target service may already be alive and healthy, and the platform can refuse it.
+     * A refused start never delivers
      * `onStartCommand`, so neither in-service clearing path runs; recording a start-rejected marker
      * there would hand GLY-254 a resume that is not owed. The probe defaults to "not running" so
      * call sites without a liveness signal keep today's behaviour.

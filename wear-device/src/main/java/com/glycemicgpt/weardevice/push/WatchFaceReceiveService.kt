@@ -3,6 +3,7 @@ package com.glycemicgpt.weardevice.push
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
@@ -68,6 +69,46 @@ class WatchFaceReceiveService : WearableListenerService() {
         // Open the timeout store now so [onTimeout], which has only seconds to run, never has
         // to read a prefs file from disk.
         FgsTimeoutReporter.init(applicationContext)
+    }
+
+    /**
+     * A `startService`/`startForegroundService` delivery, which for this service always carries
+     * nothing to do: pushes arrive over the GMS channel and land in [onChannelOpened], which does
+     * its own foreground promotion around the transfer it starts.
+     *
+     * It still has to be answered, and only one answer works. This service is exported (the Data
+     * Layer dispatches to it by intent filter) and declares `foregroundServiceType="dataSync"`, so
+     * anything on the watch can aim a `startForegroundService` at it -- and the platform then
+     * requires a matching `startForeground`. Inheriting the default `onStartCommand` misses the
+     * 30 s deadline and the process dies with `ForegroundServiceDidNotStartInTimeException`;
+     * simply calling `stopSelf` instead is *also* fatal, and faster -- the platform crashes a
+     * service that stops while it still owes a promotion. Both were reproduced on the phone side's
+     * twin of this service (`WearChatRelayService`) on an Android 16 emulator.
+     *
+     * So the obligation is discharged the only way that is not fatal: promote, then drop straight
+     * back out if no transfer is holding the promotion -- under the same [foregroundLock] a real
+     * push takes, which is what keeps this start command from demoting out from under one already
+     * under way. `stopSelf` is safe once the promotion is discharged, and does not destroy the
+     * service while GMS holds its binding.
+     *
+     * The promotion is unconditional, unlike [onChannelOpened]'s, which fires on the 0 -> 1
+     * transition. [activePushCount] counts transfers, not foreground state, and the two come apart
+     * as soon as a promotion is refused: a transfer whose [tryPromoteToForeground] was rejected
+     * leaves the counter at 1 with the service still in the background, and a counter-gated start
+     * command would then skip the one call that discharges the obligation. `startForeground` on a
+     * service that is already foreground just refreshes the same notification id, so promoting
+     * every time costs nothing.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        synchronized(foregroundLock) {
+            tryPromoteToForeground()
+            if (activePushCount.get() == 0) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+        }
+        stopSelf(startId)
+        return START_NOT_STICKY
     }
 
     /**
