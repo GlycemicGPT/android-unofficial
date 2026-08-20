@@ -4,10 +4,9 @@ import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.local.GlucoseRangeStore
 import com.glycemicgpt.mobile.data.local.SafetyLimitsStore
 import com.glycemicgpt.mobile.domain.alerting.AlertTypes
-import com.glycemicgpt.mobile.data.local.dao.RawHistoryLogDao
 import com.glycemicgpt.mobile.domain.format.GlucoseFormat
 import com.glycemicgpt.mobile.domain.model.PumpActivityMode
-import com.glycemicgpt.mobile.data.local.entity.RawHistoryLogEntity
+import com.glycemicgpt.mobile.data.repository.HistoryBackfillWriter
 import com.glycemicgpt.mobile.data.repository.PumpDataRepository
 import com.glycemicgpt.mobile.data.repository.SyncQueueEnqueuer
 import com.glycemicgpt.mobile.domain.model.CgmReading
@@ -20,7 +19,9 @@ import com.glycemicgpt.mobile.wear.WearHistorySerializer
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -47,7 +48,9 @@ import javax.inject.Singleton
  * stop that:
  * 1. Every step runs through [runStep]: a throw is reported against (loop, step) and the loop
  *    moves on to the next step. One bad row, parse, or sync enqueue costs one reading, not history
- *    backfill forever.
+ *    backfill forever. The history step is the one place a failure costs the whole unit of work:
+ *    a backfill batch is all-or-nothing by design (GLY-250), so it is re-fetched next cycle
+ *    rather than half-committed.
  * 2. Each loop body runs under [superviseLoop]: anything that escapes the step guards is reported,
  *    backed off, and the loop is relaunched rather than left dead.
  * 3. Every loop publishes a heartbeat to [PollLoopHealthTracker] — the timestamp of the last
@@ -65,7 +68,7 @@ class PumpPollingOrchestrator @Inject constructor(
     private val pumpDriver: PumpDriver,
     private val repository: PumpDataRepository,
     private val syncEnqueuer: SyncQueueEnqueuer,
-    private val rawHistoryLogDao: RawHistoryLogDao,
+    private val historyBackfill: HistoryBackfillWriter,
     private val wearDataSender: WearDataSender,
     private val glucoseRangeStore: GlucoseRangeStore,
     private val safetyLimitsStore: SafetyLimitsStore,
@@ -79,15 +82,11 @@ class PumpPollingOrchestrator @Inject constructor(
     @Volatile
     var backendSyncManager: BackendSyncManager? = null
 
-    /** Track the last known raw event sequence number to fetch incrementally. */
+    /** The sequence number the next history fetch resumes from: the in-memory mirror of the
+     *  persisted backfill cursor. It moves only after a batch's derived records are committed,
+     *  never at the raw insert — see [readSequenceAnchor] and [HistoryBackfillWriter]. */
     @Volatile
     private var lastSequenceNumber: Int = 0
-
-    /** Whether [lastSequenceNumber] has been resolved from Room this process. Until it has,
-     *  [lastSequenceNumber] is not a resume anchor, just its zero default — see
-     *  [readSequenceAnchor]. */
-    @Volatile
-    private var sequenceAnchorRestored: Boolean = false
 
     /** Whether hardware info has been cached this session. */
     @Volatile
@@ -131,25 +130,12 @@ class PumpPollingOrchestrator @Inject constructor(
         stop() // cancel any previous jobs
         synchronized(lock) {
             connectionWatcherJob = scope.launch {
-                // Restore last known sequence number from Room to avoid re-downloading.
-                // Guarded (GLY-249): this read used to run bare, so a Room/SQLCipher failure here
-                // killed the watcher before it ever observed a connection state — no loops, no
-                // polling, no telemetry, for the life of the service. The slow loop retries it.
-                try {
-                    readSequenceAnchor()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    // Exception class only at ERROR, throwable at DEBUG — same discipline as
-                    // [runStep]: this is a Room/SQLCipher failure, and its message can quote the
-                    // failing statement or row, which is history-log data.
-                    Timber.e(
-                        "Failed to read the history resume anchor (%s); the slow loop will retry",
-                        e.javaClass.simpleName,
-                    )
-                    Timber.d(e, "History resume anchor read failure detail")
-                }
-
+                // No Room read here at all any more. The watcher used to restore the resume
+                // anchor before observing anything, which meant a Room/SQLCipher failure could
+                // kill it outright — no loops, no polling, no telemetry, for the life of the
+                // service (GLY-249 guarded that; GLY-250 removes the need for it). The anchor is
+                // now read at the top of every history poll instead, where a failure costs one
+                // backfill cycle and reports on the step guard.
                 pumpDriver.observeConnectionState().collectLatest { state ->
                     if (state == ConnectionState.CONNECTED) {
                         val isReconnection = hasBeenConnectedBefore
@@ -236,14 +222,21 @@ class PumpPollingOrchestrator @Inject constructor(
     }
 
     /**
-     * Resolve the history resume anchor — the highest sequence number already stored — so the
-     * backfill continues where it left off instead of re-reading the pump's whole history.
+     * Resolve the history resume anchor — the highest sequence number whose DERIVED records are
+     * committed — so the backfill continues where it left off instead of re-reading the pump's
+     * whole history.
      *
-     * Throws whatever Room throws; both callers decide what that means for them.
+     * Reads the persisted backfill cursor, not `MAX(sequenceNumber)` of the raw table (GLY-250).
+     * The raw table advances at the raw insert, ahead of the CGM/bolus/basal writes it feeds, so
+     * anchoring on it resumed above records that were never derived and lost them for good.
+     * A null cursor is a fresh install; anything else throws and stays distinguishable from one.
+     *
+     * Throws whatever Room throws, deliberately: the caller lets it reach [runStep], which
+     * reports it and retries next cycle. Degrading a transient database error to anchor 0 would
+     * re-download the pump's entire history behind the user's back (GLY-249).
      */
     private suspend fun readSequenceAnchor() {
-        lastSequenceNumber = rawHistoryLogDao.getMaxSequenceNumber() ?: 0
-        sequenceAnchorRestored = true
+        lastSequenceNumber = historyBackfill.processedThroughSequence() ?: 0
     }
 
     private fun effectiveInterval(baseMs: Long): Long =
@@ -810,13 +803,35 @@ class PumpPollingOrchestrator @Inject constructor(
      * On fresh installs (lastSequenceNumber == 0), performs a full initial sync
      * with extended duration (10 minutes) and requests the full pump history
      * from the BLE driver (no lookback limit, larger batch caps).
+     *
+     * Batch persistence is all-or-nothing and the resume cursor is the last thing to move
+     * (GLY-250) — see [HistoryBackfillWriter]. A batch that fails anywhere is simply re-fetched
+     * next cycle, so a record this build cannot parse or persist stalls the backfill at that
+     * batch rather than skipping past it. That is the deliberate trade: a stall freezes the slow
+     * loop's heartbeat and reports on the failure ladder, where skipping was silent and
+     * permanent. For that to hold, a stall has to be able to reach the ladder — so a driver that
+     * cannot make progress fails the fetch, and this step lets the failure out rather than
+     * logging it and returning as though the backfill were caught up.
+     *
+     * The durable cursor is the ONLY progress marker, and everything else is subordinate to it:
+     * it is re-read at the top of every cycle, and the driver's own scan position moves only
+     * when this loop acknowledges a batch. A driver that advanced its position at fetch time
+     * would skip a batch outright the moment a BLE flap cancelled the loop in between — see
+     * [PumpDriver.acknowledgeHistoryLogs].
      */
     private suspend fun pollHistoryLogs() {
-        // Retry a resume anchor the connection watcher could not read. Deliberately unguarded: a
-        // still-broken DB throws into [runStep], which reports it as (slow, history_logs) and
-        // retries next cycle — far better than backfilling from a bogus anchor of 0, which would
-        // re-download the pump's entire history behind the user's back.
-        if (!sequenceAnchorRestored) readSequenceAnchor()
+        // Re-read the durable cursor EVERY cycle, not just when the watcher's read failed. The
+        // in-memory mirror can lag it: `commitDerivedBatch` can commit and then still throw
+        // `CancellationException` on the way out (`withTransaction` resumes through
+        // `withContext`, which checks cancellation after the block has run), and the connection
+        // watcher cancels the poll loops on every non-CONNECTED emission — the BLE flap this
+        // epic exists for. A lagging mirror re-fetches an already-committed batch; re-reading
+        // one indexed single-row value per five-minute cycle removes the lag at the source.
+        //
+        // Deliberately unguarded: a broken DB throws into [runStep], which reports it as
+        // (slow, history_logs) and retries next cycle — far better than backfilling from a bogus
+        // anchor of 0, which would re-download the pump's entire history behind the user's back.
+        readSequenceAnchor()
 
         val limits = safetyLimitsStore.toSafetyLimits()
         if (safetyLimitsStore.isStale()) {
@@ -843,13 +858,25 @@ class PumpPollingOrchestrator @Inject constructor(
                 pumpDriver.getHistoryLogs(sinceSequence = lastSequenceNumber)
             }
 
-            if (result.isFailure) {
-                Timber.w(result.exceptionOrNull(), "Failed to poll history logs (batch %d)", batchCount)
-                break
+            // Rethrown into [runStep], which reports it against the slow loop and retries next
+            // cycle. Swallowing it here made a driver that cannot make progress — one stuck
+            // re-requesting a window it cannot decode, say — look like a healthy, caught-up
+            // backfill for as long as it lasted.
+            //
+            // A driver does not get to decide what reaches the ladder, though. [PumpDriver] is a
+            // plugin SDK, and a blanket `catch (e: Exception)` around a BLE read catches this
+            // loop's own cancellation as readily as a decode failure — so a driver can hand back
+            // a routine disconnect as a pump outage. Our own job is the authority on that, and it
+            // is checked before the failure is believed.
+            val records = result.getOrElse { failure ->
+                currentCoroutineContext().ensureActive()
+                throw failure
             }
-            val records = result.getOrNull() ?: break
 
             if (records.isEmpty()) {
+                // Nothing to persist, so the driver's scan position over an empty answer is
+                // durably accounted for by definition.
+                pumpDriver.acknowledgeHistoryLogs()
                 if (batchCount > 0) {
                     if (isInitialSync) {
                         Timber.i("Initial pump history sync complete")
@@ -863,49 +890,83 @@ class PumpPollingOrchestrator @Inject constructor(
             batchCount++
             totalRecords += records.size
 
-            // Persist raw history log records
-            val entities = records.map { record ->
-                RawHistoryLogEntity(
-                    sequenceNumber = record.sequenceNumber,
-                    rawBytesB64 = record.rawBytesB64,
-                    eventTypeId = record.eventTypeId,
-                    pumpTimeSeconds = record.pumpTimeSeconds,
-                )
-            }
-            rawHistoryLogDao.insertAll(entities)
-            val newMaxSeq = records.maxOfOrNull { it.sequenceNumber } ?: lastSequenceNumber
-            if (newMaxSeq <= lastSequenceNumber) {
-                Timber.w("History sequence not advancing (batch %d, stuck at %d), breaking", batchCount, lastSequenceNumber)
+            val batchMaxSeq = records.maxOfOrNull { it.sequenceNumber } ?: lastSequenceNumber
+            if (batchMaxSeq <= lastSequenceNumber) {
+                // Every record in this batch is at or below the cursor, so all of them are
+                // already committed — the driver rescanning old indices, which is normal after a
+                // reconnect. Acknowledging lets its scan position move past them; without that
+                // it would re-serve the same window forever and the backfill would never reach
+                // the records that ARE new.
+                pumpDriver.acknowledgeHistoryLogs()
+                Timber.d("History batch %d is at or below the cursor (%d), advancing the scan past it", batchCount, lastSequenceNumber)
                 break
             }
-            lastSequenceNumber = newMaxSeq
-            Timber.d(
-                "Fetched batch %d: %d history records, %d total so far (seq up to %d)",
-                batchCount, records.size, totalRecords, lastSequenceNumber,
+
+            // How far this batch is entitled to move the cursor, checked against how much of it
+            // there is. The cursor lands on `batchMaxSeq` and every sequence it passes over is
+            // written off as done, so the batch has to contain a record for each of them: the
+            // gap-free contract on [PumpDriver.getHistoryLogs] is what makes that true, and this
+            // is where it is verified rather than assumed. Nothing below the batch's own first
+            // record counts — the driver is entitled to resume above the cursor when the pump
+            // holds nothing in between (a purged window, a shifted index range), and that leading
+            // gap is not the batch's to justify.
+            //
+            // Both failure shapes the reviews found land here: a driver that hands over a batch
+            // with a hole in it, and a single garbage sequence number from a misframed packet
+            // that would otherwise park the cursor near Int.MAX_VALUE, permanently. Failing is
+            // the recoverable direction — the cursor stays put, the batch is re-fetched, and the
+            // failure reports on the slow loop's ladder — because a cursor that has run ahead
+            // cannot be walked back.
+            val batchMinSeq = records.minOf { it.sequenceNumber }
+            val advanceFrom = maxOf(lastSequenceNumber, batchMinSeq - 1)
+            val sequencesPassed = batchMaxSeq.toLong() - advanceFrom.toLong()
+            val recordsInBatch = records.distinctBy { it.sequenceNumber }.size
+            if (sequencesPassed > recordsInBatch) {
+                throw IllegalStateException(
+                    "History batch $batchCount would carry the cursor over $sequencesPassed " +
+                        "sequence(s) with only $recordsInBatch record(s) to account for them",
+                )
+            }
+
+            // Raw bytes first, marked unprocessed: they are the only copy of what the pump said,
+            // so they are kept whatever happens to the derivation below — and an unprocessed row
+            // is re-derivable locally, without asking the pump again.
+            historyBackfill.persistRawBatch(records)
+
+            // Parsing happens outside the transaction: it is pure CPU work with no business
+            // holding the write lock, and a record this build cannot parse must fail the batch
+            // before anything derived is committed.
+            val cgmReadings = historyLogParser.extractCgmFromHistoryLogs(records, limits)
+            val bolusEvents = historyLogParser.extractBolusesFromHistoryLogs(records, limits)
+            val basalReadings = historyLogParser.extractBasalFromHistoryLogs(records, limits)
+
+            // One transaction: derived rows + their sync-queue entries + the raw rows' processed
+            // flags + the resume cursor. All of it lands or none of it does, so a process death
+            // anywhere in this batch costs a re-fetch, never a record.
+            historyBackfill.commitDerivedBatch(
+                sequenceNumbers = records.map { it.sequenceNumber },
+                cgmReadings = cgmReadings,
+                bolusEvents = bolusEvents,
+                basalReadings = basalReadings,
+                throughInclusive = batchMaxSeq,
             )
 
-            // Extract and save CGM readings to fill chart gaps
-            val cgmReadings = historyLogParser.extractCgmFromHistoryLogs(records, limits)
-            if (cgmReadings.isNotEmpty()) {
-                repository.saveCgmBatch(cgmReadings)
-                totalCgm += cgmReadings.size
-            }
+            // Past the commit, and only now: tell the driver it may move whatever scan position
+            // it keeps. Anything that cancels the loop before this point leaves that position
+            // behind, so the batch is re-served rather than skipped — which is the whole reason
+            // the fetch does not advance it itself.
+            pumpDriver.acknowledgeHistoryLogs()
 
-            // Extract and save bolus events
-            val bolusEvents = historyLogParser.extractBolusesFromHistoryLogs(records, limits)
-            if (bolusEvents.isNotEmpty()) {
-                repository.saveBoluses(bolusEvents)
-                syncEnqueuer.enqueueBoluses(bolusEvents)
-                totalBolus += bolusEvents.size
-            }
-
-            // Extract and save basal delivery events
-            val basalReadings = historyLogParser.extractBasalFromHistoryLogs(records, limits)
-            if (basalReadings.isNotEmpty()) {
-                repository.saveBasalBatch(basalReadings)
-                syncEnqueuer.enqueueBasalBatch(basalReadings)
-                totalBasal += basalReadings.size
-            }
+            // Same for the in-memory cursor: it is the anchor the next fetch resumes from, and
+            // it must never run ahead of what is durable.
+            lastSequenceNumber = batchMaxSeq
+            totalCgm += cgmReadings.size
+            totalBolus += bolusEvents.size
+            totalBasal += basalReadings.size
+            Timber.d(
+                "Committed batch %d: %d history records, %d total so far (seq up to %d)",
+                batchCount, records.size, totalRecords, lastSequenceNumber,
+            )
 
             // Trigger backend sync after each batch so data is uploaded incrementally
             backendSyncManager?.triggerSync()

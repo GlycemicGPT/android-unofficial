@@ -3,6 +3,7 @@ package com.glycemicgpt.mobile.data.local
 import androidx.room.Database
 import androidx.room.RoomDatabase
 import com.glycemicgpt.mobile.data.local.dao.AlertDao
+import com.glycemicgpt.mobile.data.local.dao.HistoryBackfillCursorDao
 import com.glycemicgpt.mobile.data.local.dao.PumpDao
 import com.glycemicgpt.mobile.data.local.dao.RawHistoryLogDao
 import com.glycemicgpt.mobile.data.local.dao.SyncDao
@@ -11,6 +12,7 @@ import com.glycemicgpt.mobile.data.local.entity.BasalReadingEntity
 import com.glycemicgpt.mobile.data.local.entity.BatteryReadingEntity
 import com.glycemicgpt.mobile.data.local.entity.BolusEventEntity
 import com.glycemicgpt.mobile.data.local.entity.CgmReadingEntity
+import com.glycemicgpt.mobile.data.local.entity.HistoryBackfillCursorEntity
 import com.glycemicgpt.mobile.data.local.entity.IoBReadingEntity
 import com.glycemicgpt.mobile.data.local.entity.RawHistoryLogEntity
 import com.glycemicgpt.mobile.data.local.entity.ReservoirReadingEntity
@@ -27,8 +29,9 @@ import com.glycemicgpt.mobile.data.local.entity.SyncQueueEntity
         RawHistoryLogEntity::class,
         CgmReadingEntity::class,
         AlertEntity::class,
+        HistoryBackfillCursorEntity::class,
     ],
-    version = 13,
+    version = 14,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -36,4 +39,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun syncDao(): SyncDao
     abstract fun rawHistoryLogDao(): RawHistoryLogDao
     abstract fun alertDao(): AlertDao
+    abstract fun historyBackfillCursorDao(): HistoryBackfillCursorDao
 }

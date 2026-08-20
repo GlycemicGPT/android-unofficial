@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 Josh Engelbrecht -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+          Debug-only harness that runs one history-backfill batch in its own process so an
+          instrumented test can kill that process for real, mid-batch (GLY-250). It is declared
+          here rather than in the test APK because the test APK has a different uid and so cannot
+          share the database file under test. Never present in release builds.
+        -->
+        <receiver
+            android:name="com.glycemicgpt.mobile.debug.BackfillKillHarnessReceiver"
+            android:exported="false"
+            android:process=":backfillkill" />
+    </application>
+
+</manifest>

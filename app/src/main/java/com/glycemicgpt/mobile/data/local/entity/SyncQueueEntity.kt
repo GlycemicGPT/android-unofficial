@@ -15,6 +15,7 @@ import androidx.room.PrimaryKey
     tableName = "sync_queue",
     indices = [
         Index(value = ["status", "createdAtMs"]),
+        Index(value = ["dedupeKey"], unique = true),
     ],
 )
 data class SyncQueueEntity(
@@ -23,6 +24,21 @@ data class SyncQueueEntity(
     val eventTimestampMs: Long,
     /** JSON-serialized PumpEventDto payload. */
     val payload: String,
+    /**
+     * Identity of the pump event this row uploads, for rows that must not be queued twice
+     * (GLY-250). Unique where set; NULL where not.
+     *
+     * History-backfill rows carry one because re-processing a batch has to be idempotent all the
+     * way to the upload: the derived tables collapse duplicates on their unique indices and this
+     * queue used to be the one table that did not, so a replayed batch uploaded its boluses and
+     * basal rates twice and ate the queue's size budget doing it.
+     *
+     * The live poll paths leave it NULL and keep their old insert-always semantics -- SQLite
+     * treats NULLs in a unique index as distinct, so nothing there changes. Dedupe covers rows
+     * still WAITING to upload; once a row is delivered and deleted the key is free again, which
+     * is the intended scope (the backend dedupes on its own natural keys).
+     */
+    val dedupeKey: String? = null,
     val status: String = STATUS_PENDING,
     val retryCount: Int = 0,
     val createdAtMs: Long = System.currentTimeMillis(),

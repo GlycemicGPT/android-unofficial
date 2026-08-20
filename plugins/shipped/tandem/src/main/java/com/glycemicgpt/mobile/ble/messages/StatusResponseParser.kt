@@ -451,10 +451,28 @@ internal object StatusResponseParser {
             val pumpTimeSec = buf.int.toLong() and 0xFFFFFFFFL
             val seqNum = buf.int // record index (used as sequence number for tracking)
 
-            // Sanity check: reject obviously invalid fields.
-            if (seqNum == 0 || eventTypeId > MAX_KNOWN_EVENT_TYPE) {
+            // Sanity check: a zero record index is padding, not a record -- it has no place in
+            // the pump's index space, so there is nothing for a cursor to skip over.
+            //
+            // An event type above MAX_KNOWN_EVENT_TYPE is NOT dropped (GLY-250). It used to be,
+            // which put a hole in the middle of a batch: the caller's cursor advances to
+            // max(sequenceNumber) of what comes back, so the dropped record was stepped over
+            // permanently AND its raw bytes were never stored, leaving nothing to re-derive from
+            // when a later build learns the event. Unknown types simply derive nothing -- every
+            // extractor filters on the event ids it knows -- so keeping the record costs one raw
+            // row and keeps the batch contiguous.
+            //
+            // Dropping them also happened to be the only thing bounding what a misframed packet
+            // could do to the cursor. That job now belongs where it can be done properly: the
+            // driver checks every decoded index against the window it requested, which the
+            // pump's own reported range bounds. This parser deliberately reports what the bytes
+            // say and judges none of it beyond the framing.
+            if (seqNum == 0) {
                 pos += STREAM_RECORD_SIZE
                 continue
+            }
+            if (eventTypeId > MAX_KNOWN_EVENT_TYPE) {
+                Timber.d("Unknown history event type %d at index %d; keeping raw bytes", eventTypeId, seqNum)
             }
 
             // Store the full 26-byte record so all event fields remain

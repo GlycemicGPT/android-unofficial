@@ -4,7 +4,7 @@ import android.util.Log
 import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.local.GlucoseRangeStore
 import com.glycemicgpt.mobile.data.local.SafetyLimitsStore
-import com.glycemicgpt.mobile.data.local.dao.RawHistoryLogDao
+import com.glycemicgpt.mobile.data.repository.HistoryBackfillWriter
 import com.glycemicgpt.mobile.data.repository.PumpDataRepository
 import com.glycemicgpt.mobile.data.repository.SyncQueueEnqueuer
 import com.glycemicgpt.mobile.domain.alerting.AlertTypes
@@ -24,11 +24,14 @@ import com.glycemicgpt.mobile.domain.pump.PumpDriver
 import com.glycemicgpt.mobile.wear.WearDataSender
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.coVerifyOrder
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
@@ -77,7 +80,10 @@ class PumpPollingOrchestratorTest {
         coEvery { getLatestBolusTimestamp() } returns null
     }
     private val syncEnqueuer = mockk<SyncQueueEnqueuer>(relaxed = true)
-    private val rawHistoryLogDao = mockk<RawHistoryLogDao>(relaxed = true)
+    private val historyBackfill = mockk<HistoryBackfillWriter>(relaxed = true) {
+        // No cursor row = fresh install, the same thing an empty raw table used to mean.
+        coEvery { processedThroughSequence() } returns null
+    }
     private val wearDataSender = mockk<WearDataSender>(relaxed = true)
     private val glucoseRangeStore = mockk<GlucoseRangeStore>(relaxed = true) {
         every { urgentLow } returns GlucoseRangeStore.DEFAULT_URGENT_LOW
@@ -149,7 +155,7 @@ class PumpPollingOrchestratorTest {
         PumpPollingOrchestrator.REQUEST_STAGGER_MS * 4 +
         PumpPollingOrchestrator.BACKFILL_BATCH_STAGGER_MS * 2 + 100
 
-    private fun createOrchestrator() = PumpPollingOrchestrator(pumpDriver, repository, syncEnqueuer, rawHistoryLogDao, wearDataSender, glucoseRangeStore, safetyLimitsStore, historyLogParser, appSettingsStore, alertFloor, loopHealth)
+    private fun createOrchestrator() = PumpPollingOrchestrator(pumpDriver, repository, syncEnqueuer, historyBackfill, wearDataSender, glucoseRangeStore, safetyLimitsStore, historyLogParser, appSettingsStore, alertFloor, loopHealth)
 
     @After
     fun tearDown() {
@@ -878,19 +884,19 @@ class PumpPollingOrchestratorTest {
     @Test
     fun `slow loop survives a throwing history DAO and keeps polling`() = runTest {
         stubHistoryBackfill()
-        coEvery { rawHistoryLogDao.insertAll(any()) } throws RuntimeException("SQLCipher error")
+        coEvery { historyBackfill.persistRawBatch(any()) } throws RuntimeException("SQLCipher error")
         val orchestrator = createOrchestrator()
         orchestrator.start(this)
 
         connectionStateFlow.value = ConnectionState.CONNECTED
         advanceTimeBy(ALL_SETTLE_MS)
-        coVerify(exactly = 1) { rawHistoryLogDao.insertAll(any()) }
+        coVerify(exactly = 1) { historyBackfill.persistRawBatch(any()) }
         // Steps after the failing one still run in the same iteration.
         coVerify(exactly = 1) { pumpDriver.getPumpHardwareInfo() }
 
         advanceTimeBy(SLOW_CYCLE_MS)
         coVerify(exactly = 2) { pumpDriver.getBatteryStatus() }
-        coVerify(exactly = 2) { rawHistoryLogDao.insertAll(any()) }
+        coVerify(exactly = 2) { historyBackfill.persistRawBatch(any()) }
         assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
         orchestrator.stop()
     }
@@ -986,9 +992,10 @@ class PumpPollingOrchestratorTest {
     @Test
     fun `a throwing history anchor read does not stop polling and is retried`() = runTest {
         stubHistoryBackfill()
-        // The connection watcher reads the resume anchor before it observes anything. Unguarded,
-        // this throw used to kill the watcher outright: no loops, no polling, no telemetry.
-        coEvery { rawHistoryLogDao.getMaxSequenceNumber() } throws RuntimeException("SQLCipher")
+        // A broken database must cost one backfill cycle, not the whole service: this throw used
+        // to reach the connection watcher and kill it outright -- no loops, no polling, no
+        // telemetry -- and must never be read as "fresh install, download everything" either.
+        coEvery { historyBackfill.processedThroughSequence() } throws RuntimeException("SQLCipher")
         val orchestrator = createOrchestrator()
         orchestrator.start(this)
 
@@ -1006,7 +1013,7 @@ class PumpPollingOrchestratorTest {
         coVerify(atLeast = 1) { pumpDriver.getBatteryStatus() }
 
         // Once Room answers again, the backfill resumes from the stored anchor.
-        coEvery { rawHistoryLogDao.getMaxSequenceNumber() } returns 4_200
+        coEvery { historyBackfill.processedThroughSequence() } returns 4_200
         advanceTimeBy(SLOW_CYCLE_MS)
         coVerify(atLeast = 1) { pumpDriver.getHistoryLogs(4_200) }
         orchestrator.stop()
@@ -1208,6 +1215,320 @@ class PumpPollingOrchestratorTest {
         advanceTimeBy(SETTLE_TIME_MS)
         assertTrue("relaunched loop must report running", loopHealth.snapshot(PollLoop.FAST).running)
         coVerify(atLeast = 2) { pumpDriver.getIoB() }
+        orchestrator.stop()
+    }
+
+    // -- GLY-250: the resume cursor must never run ahead of committed derived data ----
+    // The backfill used to insert raw rows, take MAX(sequenceNumber) off that table as the
+    // resume anchor, and only then derive and save CGM/bolus/basal rows. Anything that failed
+    // in between left the anchor above records nothing would ever re-derive. These tests pin
+    // the ordering; HistoryBackfillWriterTest pins the atomicity it relies on.
+
+    /** A resume, not a fresh install: a non-zero anchor takes the incremental fetch path. */
+    private val RESUME_ANCHOR = 500
+
+    /** One batch sitting above [RESUME_ANCHOR]. */
+    private val resumeBatch = listOf(historyRecords.first().copy(sequenceNumber = 600))
+
+    /** Backfill that resumes from [RESUME_ANCHOR] and answers one batch of [resumeBatch]. */
+    private fun stubResumedBackfill() {
+        stubHistoryBackfill()
+        coEvery { historyBackfill.processedThroughSequence() } returns RESUME_ANCHOR
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns Result.success(resumeBatch)
+    }
+
+    @Test
+    fun `the resume anchor comes from the backfill cursor, not the raw table`() = runTest {
+        stubResumedBackfill()
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerify(exactly = 1) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+        // A stored cursor is not a fresh install, so no full-history download.
+        coVerify(exactly = 0) { pumpDriver.getFullHistoryLogs(any()) }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a batch persists raw bytes first, then commits everything derived in one call`() = runTest {
+        stubResumedBackfill()
+        val cgm = listOf(
+            CgmReading(glucoseMgDl = 118, trendArrow = CgmTrend.FLAT, timestamp = Instant.now()),
+        )
+        every { historyLogParser.extractCgmFromHistoryLogs(any(), any()) } returns cgm
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerifyOrder {
+            historyBackfill.persistRawBatch(resumeBatch)
+            historyBackfill.commitDerivedBatch(listOf(600), cgm, emptyList(), emptyList(), 600, any())
+        }
+        // The derived writes and their queue rows belong to the batch transaction now; the
+        // backfill must not reach around it to the loose per-reading writers.
+        coVerify(exactly = 0) { repository.saveCgmBatch(any()) }
+        coVerify(exactly = 0) { syncEnqueuer.enqueueBasalBatch(any()) }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a failed derived commit leaves the anchor where it was and the batch is refetched`() = runTest {
+        stubResumedBackfill()
+        coEvery {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), any(), any())
+        } throws RuntimeException("killed mid-batch")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        coVerify(exactly = 1) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+
+        // Next cycle asks from the SAME sequence: an uncommitted batch is not progress. Before
+        // GLY-250 the anchor had already moved to 600 and those records were gone for good.
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+        coVerify(exactly = 0) { pumpDriver.getHistoryLogs(600) }
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `an unparseable record fails the batch before anything derived is committed`() = runTest {
+        stubResumedBackfill()
+        every {
+            historyLogParser.extractBasalFromHistoryLogs(any(), any())
+        } throws IllegalArgumentException("unparseable record")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        // Raw bytes are kept -- they are the only copy of what the pump said, and a later build
+        // (or the re-derivation pass) can still read them.
+        coVerify(exactly = 1) { historyBackfill.persistRawBatch(resumeBatch) }
+        coVerify(exactly = 0) {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), any(), any())
+        }
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a committed batch moves the anchor so the next batch resumes above it`() = runTest {
+        stubResumedBackfill()
+        // A pump with more history than one batch: each fetch answers just past what it was
+        // asked from, so the anchor's movement is visible in the next request.
+        coEvery { pumpDriver.getHistoryLogs(any()) } coAnswers {
+            Result.success(listOf(historyRecords.first().copy(sequenceNumber = firstArg<Int>() + 10)))
+        }
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerify(exactly = 1) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+        coVerify(exactly = 1) { pumpDriver.getHistoryLogs(RESUME_ANCHOR + 10) }
+        coVerifyOrder {
+            historyBackfill.commitDerivedBatch(
+                listOf(RESUME_ANCHOR + 10), any(), any(), any(), RESUME_ANCHOR + 10, any(),
+            )
+            historyBackfill.commitDerivedBatch(
+                listOf(RESUME_ANCHOR + 20), any(), any(), any(), RESUME_ANCHOR + 20, any(),
+            )
+        }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `the driver's scan position is acknowledged only after the batch commits`() = runTest {
+        stubResumedBackfill()
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerifyOrder {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), any(), any())
+            pumpDriver.acknowledgeHistoryLogs()
+        }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a failed commit leaves the driver's scan position unacknowledged`() = runTest {
+        stubResumedBackfill()
+        coEvery {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), any(), any())
+        } throws RuntimeException("killed mid-batch")
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        // The whole point of the acknowledgement: a driver that keeps its own scan position must
+        // not step past a batch nobody persisted. A BLE flap between fetch and commit is exactly
+        // this shape, and moving the position there loses the batch for good.
+        coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a batch at or below the cursor is acknowledged so the scan can move past it`() = runTest {
+        stubHistoryBackfill()
+        coEvery { historyBackfill.processedThroughSequence() } returns RESUME_ANCHOR
+        // What a Tandem rescan hands over after a reconnect: records the cursor already covers.
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns Result.success(
+            listOf(historyRecords.first().copy(sequenceNumber = RESUME_ANCHOR - 50)),
+        )
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        // Nothing to commit -- but withholding the acknowledgement here would pin a progressive
+        // scanner on the same window forever, so the backfill would never reach what IS new.
+        coVerify(exactly = 0) {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), any(), any())
+        }
+        coVerify(atLeast = 1) { pumpDriver.acknowledgeHistoryLogs() }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `the anchor is re-read every cycle, so the in-memory mirror cannot lag the cursor`() = runTest {
+        stubResumedBackfill()
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+        coVerify(exactly = 1) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+
+        // The durable cursor moved without this process seeing it: a commit that lands and then
+        // throws CancellationException on the way out (a BLE flap during the commit does that)
+        // leaves the in-memory mirror behind. Re-reading is what stops the next cycle from
+        // re-fetching -- and re-uploading -- a batch that is already committed.
+        coEvery { historyBackfill.processedThroughSequence() } returns RESUME_ANCHOR + 500
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(exactly = 1) { pumpDriver.getHistoryLogs(RESUME_ANCHOR + 500) }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a batch too small to account for the ground it covers is refused`() = runTest {
+        stubResumedBackfill()
+        // What a misframed packet decodes to, or a driver that hands over a window with a hole in
+        // it: the cursor would land on 4 200 000 and write off everything below it, on the
+        // strength of two records. `advanceTo` only moves forward, so this is not recoverable
+        // once committed -- every later batch reads as already-processed and the backfill stops
+        // committing anything at all.
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns Result.success(
+            listOf(
+                historyRecords.first().copy(sequenceNumber = RESUME_ANCHOR + 1),
+                historyRecords.first().copy(sequenceNumber = 4_200_000),
+            ),
+        )
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerify(exactly = 0) {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), any(), any())
+        }
+        coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+
+        // ...and the cursor has not moved, so the batch is offered again.
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a batch resuming above a gap the pump does not hold is allowed`() = runTest {
+        stubResumedBackfill()
+        // The mirror image of the test above, and the reason the check counts only the ground the
+        // batch itself spans: a driver is entitled to answer from well above the cursor when the
+        // pump holds nothing in between -- a purged window, a shifted index range. Twelve records
+        // starting 3 000 sequences up is a legitimate answer, not a batch with a hole in it.
+        val jumpStart = RESUME_ANCHOR + 3_000
+        val batch = (0 until 12).map { historyRecords.first().copy(sequenceNumber = jumpStart + it) }
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns Result.success(batch)
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerify(atLeast = 1) {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), jumpStart + 11, any())
+        }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a driver that cannot make progress reports instead of looking caught up`() = runTest {
+        stubResumedBackfill()
+        // A stalled scan -- a packet this build cannot decode, re-requested every cycle. Logging
+        // it and returning made the step look healthy, so a backfill halted indefinitely was
+        // indistinguishable from one with nothing left to fetch.
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns
+            Result.failure(IllegalStateException("History log scan stalled"))
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a driver that hands back this loop's cancellation does not report a stall`() = runTest {
+        stubResumedBackfill()
+        // The other side of the test above. A driver read is a BLE read wrapped in a blanket
+        // `catch (e: Exception)`, and that catches the connection watcher's teardown -- which
+        // fires on every non-CONNECTED state, i.e. on the ordinary flap this whole epic is
+        // about -- as readily as a packet it cannot decode. Believing a failure handed back by a
+        // cancelled call is what makes the ladder unable to tell the two apart, so the loop's own
+        // job is checked first. [PumpDriver] is a plugin SDK: third-party drivers get this
+        // wrong for free.
+        coEvery { pumpDriver.getHistoryLogs(any()) } coAnswers {
+            currentCoroutineContext().cancel(CancellationException("BLE flap"))
+            Result.failure(IllegalStateException("History log scan stalled"))
+        }
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        // Cancellation, so: nothing on the ladder, and the loop is down rather than restarted
+        // with backoff -- exactly what a disconnect does to every other step.
+        val slow = loopHealth.snapshot(PollLoop.SLOW)
+        assertNull(
+            "a cancelled poll loop must not be reported as a pump that cannot make progress",
+            slow.lastFailureStep,
+        )
+        assertFalse("cancelled loop must not report running", slow.running)
+        assertEquals(0L, slow.restartCount)
+        coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
         orchestrator.stop()
     }
 }
