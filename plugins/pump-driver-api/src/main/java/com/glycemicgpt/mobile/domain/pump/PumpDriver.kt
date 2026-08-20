@@ -42,13 +42,21 @@ interface PumpDriver {
      * Two contracts the caller's persisted cursor depends on (GLY-250), because it advances to
      * `max(sequenceNumber)` of what comes back:
      *
-     *  1. **No interior gaps.** Every record the pump holds between the lowest and the highest
-     *     sequence number returned must be in the returned list. A record dropped from the middle
-     *     of a batch is skipped by the cursor forever, and its raw bytes are never stored, so
-     *     nothing can recover it later. Implementations that cannot decode part of a batch must
-     *     shorten the batch (or fail the call) rather than return it with a hole in it.
+     *  1. **No interior gaps, and only records the pump actually delivered.** Every record the
+     *     pump holds between the lowest and the highest sequence number returned must be in the
+     *     returned list. A record dropped from the middle of a batch is skipped by the cursor
+     *     forever, and its raw bytes are never stored, so nothing can recover it later. Requesting
+     *     a window is not the same as receiving it: an implementation that asks for a range and
+     *     gets part of it back must return (and resume from) only the part it can account for, and
+     *     must not return a sequence number the pump never sent it. Shortening the batch or
+     *     failing the call are both fine; returning it with a hole in it is not.
      *  2. **Nothing is consumed until [acknowledgeHistoryLogs].** Returning records is not
      *     delivery; see that method.
+     *
+     * The caller verifies contract 1 as far as it can — a batch whose span exceeds its own record
+     * count is refused — but it cannot see what the pump was asked for, so a driver that breaks
+     * the contract in a way that stays span-consistent is only caught by the driver's own checks.
+     * Failing the call is always safe: the cursor stays put and the batch is re-fetched.
      */
     suspend fun getHistoryLogs(sinceSequence: Int): Result<List<HistoryLogRecord>>
 

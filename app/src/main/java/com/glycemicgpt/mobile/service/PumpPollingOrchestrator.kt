@@ -807,7 +807,9 @@ class PumpPollingOrchestrator @Inject constructor(
      * next cycle, so a record this build cannot parse or persist stalls the backfill at that
      * batch rather than skipping past it. That is the deliberate trade: a stall freezes the slow
      * loop's heartbeat and reports on the failure ladder, where skipping was silent and
-     * permanent.
+     * permanent. For that to hold, a stall has to be able to reach the ladder — so a driver that
+     * cannot make progress fails the fetch, and this step lets the failure out rather than
+     * logging it and returning as though the backfill were caught up.
      *
      * The durable cursor is the ONLY progress marker, and everything else is subordinate to it:
      * it is re-read at the top of every cycle, and the driver's own scan position moves only
@@ -854,11 +856,11 @@ class PumpPollingOrchestrator @Inject constructor(
                 pumpDriver.getHistoryLogs(sinceSequence = lastSequenceNumber)
             }
 
-            if (result.isFailure) {
-                Timber.w(result.exceptionOrNull(), "Failed to poll history logs (batch %d)", batchCount)
-                break
-            }
-            val records = result.getOrNull() ?: break
+            // Rethrown into [runStep], which reports it against the slow loop and retries next
+            // cycle. Swallowing it here made a driver that cannot make progress — one stuck
+            // re-requesting a window it cannot decode, say — look like a healthy, caught-up
+            // backfill for as long as it lasted.
+            val records = result.getOrThrow()
 
             if (records.isEmpty()) {
                 // Nothing to persist, so the driver's scan position over an empty answer is
@@ -887,6 +889,32 @@ class PumpPollingOrchestrator @Inject constructor(
                 pumpDriver.acknowledgeHistoryLogs()
                 Timber.d("History batch %d is at or below the cursor (%d), advancing the scan past it", batchCount, lastSequenceNumber)
                 break
+            }
+
+            // How far this batch is entitled to move the cursor, checked against how much of it
+            // there is. The cursor lands on `batchMaxSeq` and every sequence it passes over is
+            // written off as done, so the batch has to contain a record for each of them: the
+            // gap-free contract on [PumpDriver.getHistoryLogs] is what makes that true, and this
+            // is where it is verified rather than assumed. Nothing below the batch's own first
+            // record counts — the driver is entitled to resume above the cursor when the pump
+            // holds nothing in between (a purged window, a shifted index range), and that leading
+            // gap is not the batch's to justify.
+            //
+            // Both failure shapes the reviews found land here: a driver that hands over a batch
+            // with a hole in it, and a single garbage sequence number from a misframed packet
+            // that would otherwise park the cursor near Int.MAX_VALUE, permanently. Failing is
+            // the recoverable direction — the cursor stays put, the batch is re-fetched, and the
+            // failure reports on the slow loop's ladder — because a cursor that has run ahead
+            // cannot be walked back.
+            val batchMinSeq = records.minOf { it.sequenceNumber }
+            val advanceFrom = maxOf(lastSequenceNumber, batchMinSeq - 1)
+            val sequencesPassed = batchMaxSeq.toLong() - advanceFrom.toLong()
+            val recordsInBatch = records.distinctBy { it.sequenceNumber }.size
+            if (sequencesPassed > recordsInBatch) {
+                throw IllegalStateException(
+                    "History batch $batchCount would carry the cursor over $sequencesPassed " +
+                        "sequence(s) with only $recordsInBatch record(s) to account for them",
+                )
             }
 
             // Raw bytes first, marked unprocessed: they are the only copy of what the pump said,

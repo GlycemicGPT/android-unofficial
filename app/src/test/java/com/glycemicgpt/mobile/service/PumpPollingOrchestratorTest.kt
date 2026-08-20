@@ -1423,4 +1423,77 @@ class PumpPollingOrchestratorTest {
         coVerify(exactly = 1) { pumpDriver.getHistoryLogs(RESUME_ANCHOR + 500) }
         orchestrator.stop()
     }
+
+    @Test
+    fun `a batch too small to account for the ground it covers is refused`() = runTest {
+        stubResumedBackfill()
+        // What a misframed packet decodes to, or a driver that hands over a window with a hole in
+        // it: the cursor would land on 4 200 000 and write off everything below it, on the
+        // strength of two records. `advanceTo` only moves forward, so this is not recoverable
+        // once committed -- every later batch reads as already-processed and the backfill stops
+        // committing anything at all.
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns Result.success(
+            listOf(
+                historyRecords.first().copy(sequenceNumber = RESUME_ANCHOR + 1),
+                historyRecords.first().copy(sequenceNumber = 4_200_000),
+            ),
+        )
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerify(exactly = 0) {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), any(), any())
+        }
+        coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+
+        // ...and the cursor has not moved, so the batch is offered again.
+        advanceTimeBy(SLOW_CYCLE_MS)
+        coVerify(exactly = 2) { pumpDriver.getHistoryLogs(RESUME_ANCHOR) }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a batch resuming above a gap the pump does not hold is allowed`() = runTest {
+        stubResumedBackfill()
+        // The mirror image of the test above, and the reason the check counts only the ground the
+        // batch itself spans: a driver is entitled to answer from well above the cursor when the
+        // pump holds nothing in between -- a purged window, a shifted index range. Twelve records
+        // starting 3 000 sequences up is a legitimate answer, not a batch with a hole in it.
+        val jumpStart = RESUME_ANCHOR + 3_000
+        val batch = (0 until 12).map { historyRecords.first().copy(sequenceNumber = jumpStart + it) }
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns Result.success(batch)
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        coVerify(atLeast = 1) {
+            historyBackfill.commitDerivedBatch(any(), any(), any(), any(), jumpStart + 11, any())
+        }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a driver that cannot make progress reports instead of looking caught up`() = runTest {
+        stubResumedBackfill()
+        // A stalled scan -- a packet this build cannot decode, re-requested every cycle. Logging
+        // it and returning made the step look healthy, so a backfill halted indefinitely was
+        // indistinguishable from one with nothing left to fetch.
+        coEvery { pumpDriver.getHistoryLogs(any()) } returns
+            Result.failure(IllegalStateException("History log scan stalled"))
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
+        orchestrator.stop()
+    }
 }

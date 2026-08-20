@@ -26,9 +26,11 @@ interface PumpStatus : PluginCapabilityInterface {
      * for the same reason -- the caller advances a persisted cursor to `max(sequenceNumber)` of
      * what comes back (GLY-250):
      *
-     *  1. **No interior gaps.** A record dropped from the middle of a batch is skipped by the
-     *     cursor forever and its raw bytes are never stored, so nothing can recover it. Shorten
-     *     the batch or fail the call instead.
+     *  1. **No interior gaps, and only records the pump actually delivered.** A record dropped
+     *     from the middle of a batch is skipped by the cursor forever and its raw bytes are never
+     *     stored, so nothing can recover it. Requesting a window is not the same as receiving it:
+     *     return only the part you can account for, never a sequence number the pump did not send.
+     *     Shorten the batch or fail the call instead.
      *  2. **Nothing is consumed until [acknowledgeHistoryLogs].**
      */
     suspend fun getHistoryLogs(sinceSequence: Int): Result<List<HistoryLogRecord>>

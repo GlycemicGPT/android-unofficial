@@ -461,6 +461,12 @@ internal object StatusResponseParser {
             // when a later build learns the event. Unknown types simply derive nothing -- every
             // extractor filters on the event ids it knows -- so keeping the record costs one raw
             // row and keeps the batch contiguous.
+            //
+            // Dropping them also happened to be the only thing bounding what a misframed packet
+            // could do to the cursor. That job now belongs where it can be done properly: the
+            // driver checks every decoded index against the window it requested, which the
+            // pump's own reported range bounds. This parser deliberately reports what the bytes
+            // say and judges none of it beyond the framing.
             if (seqNum == 0) {
                 pos += STREAM_RECORD_SIZE
                 continue
