@@ -137,8 +137,12 @@ object DatabaseModule {
      *    recovers whatever the old build dropped; the derived tables and the upload queue all
      *    dedupe, so re-deriving a row that was fine is a no-op.
      *
-     * WHAT A DOWNGRADE DOES: nothing, loudly. See the database builder -- an older build meeting
-     * schema 14 now fails to open instead of wiping the database.
+     * WHAT A DOWNGRADE DOES: installing the previously-shipped build after this migration WIPES
+     * the database. That build's own builder has the plain destructive fallback, which recreates
+     * on downgrade, and no change here can reach an APK that is already on devices -- see the
+     * builder below and `DatabaseDowngradePolicyTest`, which pins the loss rather than claiming
+     * protection. What the builder below does change is every rollback ONTO schema 14 from here
+     * on: those fail to open and keep the file.
      */
     private val MIGRATION_13_14 = object : Migration(13, 14) {
         override fun migrate(db: SupportSQLiteDatabase) {
@@ -258,6 +262,11 @@ object DatabaseModule {
             // recoverable (reinstall the newer build, or ship a real downgrade migration);
             // wiping is not. Add the version here only when losing that data is genuinely the
             // intended outcome. (GLY-250)
+            //
+            // This binds from schema 14 forward only. Rolling back to a build that shipped
+            // BEFORE it still wipes, because that build runs its own builder; nothing here can
+            // change an APK already on devices. `DatabaseDowngradePolicyTest` covers both
+            // directions and says which is which.
             .fallbackToDestructiveMigrationFrom(
                 dropAllTables = true,
                 *PRE_MIGRATION_CHAIN_VERSIONS,
