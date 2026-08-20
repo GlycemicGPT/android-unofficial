@@ -17,7 +17,10 @@ import com.glycemicgpt.mobile.domain.model.PumpSettings
 import com.glycemicgpt.mobile.domain.model.ReservoirReading
 import com.glycemicgpt.mobile.domain.pump.PumpDriver
 import com.glycemicgpt.mobile.domain.pump.SafetyLimits
+import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import timber.log.Timber
 import java.nio.ByteBuffer
@@ -280,6 +283,19 @@ class TandemBleDriver @Inject constructor(
                     timeoutMs = TandemProtocol.HISTORY_LOG_TIMEOUT_MS,
                 )
             } catch (e: Exception) {
+                // This loop's own cancellation is not a pump fault, and it must not be dressed
+                // up as one: `CancellationException` extends `Exception`, so this catch used to
+                // take the poll loop's teardown, and the caller reports a stall on the failure
+                // ladder. A user walking out of BLE range mid-window -- the connection watcher
+                // cancels the loops on every non-CONNECTED state, and a window can sit here for
+                // the full stream timeout -- then read exactly like a window this build cannot
+                // decode, which is the one distinction the ladder is here to make.
+                //
+                // A read TIMEOUT is a `CancellationException` too and stays a stall: that is the
+                // pump going quiet, not the loop being torn down. The two are told apart by our
+                // own job rather than by exception type, which also settles the race where the
+                // timeout fires just as the loop is cancelled.
+                currentCoroutineContext().ensureActive()
                 Timber.w(e, "History log stream request failed at index=%d", currentIndex)
                 stall = "the stream request for indices $currentIndex..$windowEnd failed " +
                     "(${e.javaClass.simpleName})"
@@ -490,9 +506,32 @@ class TandemBleDriver @Inject constructor(
             debugLogger.updateLastPacket(opcode, direction = DebugLogger.Direction.RX, parsedValue = parsedStr)
             Result.success(result)
         } catch (e: Exception) {
+            // Same rule as the history stream above: a cancelled caller propagates untouched
+            // instead of coming back as a failed read. The history-log range read (opcode 59)
+            // goes through here, so without this a BLE flap during it reaches the poll loop's
+            // failure ladder as a pump problem.
+            currentCoroutineContext().ensureActive()
             Timber.e(e, "BLE_RAW PARSE_ERROR opcode=0x%02x", opcode)
             debugLogger.updateLastPacket(opcode, direction = DebugLogger.Direction.RX, error = e.message ?: e.javaClass.simpleName)
-            Result.failure(e)
+            Result.failure(asReadFailure(e))
         }
     }
+
+    /**
+     * A failed read, as an exception a caller can safely rethrow.
+     *
+     * A `Result` may not carry a [CancellationException]: to every caller that type means "your
+     * coroutine was cancelled", so one handed back as a value tears the poll loop down silently
+     * rather than reporting the read that failed -- and the pump going quiet past
+     * [TandemProtocol.STATUS_READ_TIMEOUT_MS] is the ordinary way to get one, since `withTimeout`
+     * signals with a [CancellationException] subclass. Anything reaching here has already passed
+     * `ensureActive`, so a cancellation type at this point is a timed-out read (or a stale
+     * transaction id evicting the deferred this call was waiting on) and is reported as one.
+     */
+    private fun asReadFailure(e: Exception): Exception =
+        if (e is CancellationException) {
+            IllegalStateException("BLE read failed: ${e.javaClass.simpleName}", e)
+        } else {
+            e
+        }
 }

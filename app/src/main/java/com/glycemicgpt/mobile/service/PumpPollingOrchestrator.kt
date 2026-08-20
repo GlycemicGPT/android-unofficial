@@ -19,7 +19,9 @@ import com.glycemicgpt.mobile.wear.WearHistorySerializer
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -860,7 +862,16 @@ class PumpPollingOrchestrator @Inject constructor(
             // cycle. Swallowing it here made a driver that cannot make progress — one stuck
             // re-requesting a window it cannot decode, say — look like a healthy, caught-up
             // backfill for as long as it lasted.
-            val records = result.getOrThrow()
+            //
+            // A driver does not get to decide what reaches the ladder, though. [PumpDriver] is a
+            // plugin SDK, and a blanket `catch (e: Exception)` around a BLE read catches this
+            // loop's own cancellation as readily as a decode failure — so a driver can hand back
+            // a routine disconnect as a pump outage. Our own job is the authority on that, and it
+            // is checked before the failure is believed.
+            val records = result.getOrElse { failure ->
+                currentCoroutineContext().ensureActive()
+                throw failure
+            }
 
             if (records.isEmpty()) {
                 // Nothing to persist, so the driver's scan position over an empty answer is

@@ -30,6 +30,8 @@ import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
@@ -1493,6 +1495,39 @@ class PumpPollingOrchestratorTest {
         advanceTimeBy(ALL_SETTLE_MS)
 
         assertEquals(PollStep.HISTORY_LOGS, loopHealth.snapshot(PollLoop.SLOW).lastFailureStep)
+        coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
+        orchestrator.stop()
+    }
+
+    @Test
+    fun `a driver that hands back this loop's cancellation does not report a stall`() = runTest {
+        stubResumedBackfill()
+        // The other side of the test above. A driver read is a BLE read wrapped in a blanket
+        // `catch (e: Exception)`, and that catches the connection watcher's teardown -- which
+        // fires on every non-CONNECTED state, i.e. on the ordinary flap this whole epic is
+        // about -- as readily as a packet it cannot decode. Believing a failure handed back by a
+        // cancelled call is what makes the ladder unable to tell the two apart, so the loop's own
+        // job is checked first. [PumpDriver] is a plugin SDK: third-party drivers get this
+        // wrong for free.
+        coEvery { pumpDriver.getHistoryLogs(any()) } coAnswers {
+            currentCoroutineContext().cancel(CancellationException("BLE flap"))
+            Result.failure(IllegalStateException("History log scan stalled"))
+        }
+        val orchestrator = createOrchestrator()
+        orchestrator.start(this)
+
+        connectionStateFlow.value = ConnectionState.CONNECTED
+        advanceTimeBy(ALL_SETTLE_MS)
+
+        // Cancellation, so: nothing on the ladder, and the loop is down rather than restarted
+        // with backoff -- exactly what a disconnect does to every other step.
+        val slow = loopHealth.snapshot(PollLoop.SLOW)
+        assertNull(
+            "a cancelled poll loop must not be reported as a pump that cannot make progress",
+            slow.lastFailureStep,
+        )
+        assertFalse("cancelled loop must not report running", slow.running)
+        assertEquals(0L, slow.restartCount)
         coVerify(exactly = 0) { pumpDriver.acknowledgeHistoryLogs() }
         orchestrator.stop()
     }
