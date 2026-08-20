@@ -144,11 +144,34 @@ private val fixtureBasal = listOf(
     ),
 )
 
+/**
+ * Publishes a marker the test process polls for, atomically.
+ *
+ * The test returns from its wait the moment the file exists and then parses what it reads --
+ * the ready marker's contents are a pid it is about to kill. A plain `writeText` creates the
+ * file and writes it in two steps, so a poll landing between them reads an empty string and the
+ * suite dies on `NumberFormatException` instead of reporting a durability result. Staging under
+ * a temporary name and renaming makes the marker appear only once it is complete; both names
+ * are in `filesDir`, so the rename is a same-filesystem `rename(2)`.
+ */
+private fun publishMarker(context: Context, name: String, contents: String) {
+    val marker = File(context.filesDir, name)
+    val staging = File(context.filesDir, "$name.tmp")
+    staging.writeText(contents)
+    if (!staging.renameTo(marker)) {
+        // The test times out on the missing marker either way; this says why.
+        Timber.e("Could not publish harness marker %s", name)
+    }
+}
+
 private fun runBatch(context: Context, killPoint: String) {
     val stall = { point: String ->
         if (point == killPoint) {
-            File(context.filesDir, BackfillKillHarnessReceiver.READY_FILE)
-                .writeText(android.os.Process.myPid().toString())
+            publishMarker(
+                context,
+                BackfillKillHarnessReceiver.READY_FILE,
+                android.os.Process.myPid().toString(),
+            )
             Timber.i("Backfill harness parked at %s, waiting to be killed", point)
             while (true) Thread.sleep(50L)
         }
@@ -184,10 +207,13 @@ private fun runBatch(context: Context, killPoint: String) {
             stall(BackfillKillHarnessReceiver.KillPoint.AFTER_COMMIT)
         }
         db.close()
-        File(context.filesDir, BackfillKillHarnessReceiver.DONE_FILE).writeText("ok")
+        publishMarker(context, BackfillKillHarnessReceiver.DONE_FILE, "ok")
     } catch (e: Throwable) {
-        File(context.filesDir, BackfillKillHarnessReceiver.FAILED_FILE)
-            .writeText("${e.javaClass.name}: ${e.message}")
+        publishMarker(
+            context,
+            BackfillKillHarnessReceiver.FAILED_FILE,
+            "${e.javaClass.name}: ${e.message}",
+        )
         Timber.e(e, "Backfill harness failed")
     }
 }
