@@ -6,8 +6,17 @@ import androidx.room.Entity
 import androidx.room.PrimaryKey
 
 /**
- * The history backfill resume cursor: the highest pump sequence number whose DERIVED data
- * (CGM / bolus / basal rows plus their sync-queue entries) is committed.
+ * The history backfill resume cursor: the highest pump sequence number whose DERIVED rows
+ * (CGM / bolus / basal) are committed. That is the whole of what it promises. It does NOT
+ * promise the matching sync-queue entries exist: when a batch cannot build its upload rows,
+ * `HistoryBackfillWriter.commitDerivedBatch` commits the derived rows and advances this cursor
+ * anyway -- losing local data over a failure to serialize an upload is the worse trade -- and
+ * leaves those raw rows at `processed = 0` instead. Upload completeness is what
+ * [RawHistoryLogEntity.processed] tracks, and a re-derivation pass reads it, not this.
+ *
+ * So the two can legitimately disagree: the cursor may sit above raw rows still flagged
+ * unprocessed. Anything resuming the pump scan reads this; anything reconciling uploads reads
+ * the flag.
  *
  * Single-row table, keyed on [CURSOR_ROW_ID].
  *
