@@ -29,6 +29,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The chat relay shares the app's `dataSync` budget with the alert stream, so Android 15 can
@@ -163,12 +164,20 @@ class WearChatRelayServiceTimeoutTest {
         val insidePromotion = CountDownLatch(1)
         val releasePromotion = CountDownLatch(1)
         val workStarted = CountDownLatch(1)
+        val promotions = AtomicInteger(0)
         mockkObject(ForegroundServiceStarter)
         every {
             ForegroundServiceStarter.promote(any(), any(), any(), any(), any(), any())
         } answers {
-            insidePromotion.countDown()
-            releasePromotion.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            // Only the FIRST promotion blocks, which is the start command's. `startWork` promotes
+            // too when it takes the counter from zero, so a mock that blocked every call would
+            // park an unlocked watch-message thread in here instead of letting it reach
+            // `workStarted` -- and the negative assertion below would pass with the lock removed,
+            // which is the one thing it exists to rule out.
+            if (promotions.getAndIncrement() == 0) {
+                insidePromotion.countDown()
+                releasePromotion.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            }
             ForegroundServiceStartResult.Started
         }
 

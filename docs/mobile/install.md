@@ -132,11 +132,11 @@ The app does not auto-update -- there's no Play Store distribution today. F-Droi
 
 ### Going back to an older version erases your local data
 
-> **Read this before you roll back.** Installing a release older than the one you're on today will wipe the app's local database: your on-phone pump history, the alerts it has recorded, anything still queued to upload, and the raw pump records the app keeps so it can rebuild readings without asking the pump again. Android does the wipe as part of the install, without asking, and there is no undo.
+> **Read this before you roll back.** Going back to a release older than the one you're on today will wipe the app's local database: your on-phone pump history, the alerts it has recorded, anything still queued to upload, and the raw pump records the app keeps so it can rebuild readings without asking the pump again. Nothing asks you first, and there is no undo.
 >
 > Data already uploaded to your platform is safe -- this only affects what's stored on the phone.
 
-Why it happens: each release ships a database layout, and the app knows how to move an older layout forward but not a newer one backward. The older APK you install has no way to read the newer database, and the version you'd be going back to handles that by deleting it.
+Why it happens: each release ships a database layout, and the app knows how to move an older layout forward but not a newer one backward. The wipe isn't part of the install itself. It happens the first time the older app opens a database newer than the layout it was built for: it can't read it, so it deletes it and starts an empty one. By the time you notice the app is running, the data is already gone.
 
 Going forward is always safe -- installing a newer release keeps everything.
 
@@ -147,6 +147,8 @@ If you need to roll back anyway:
 
 ## A few notes
 
-- **Battery and Bluetooth:** the app stays connected to your pump in the background, which uses some battery. On most phones the impact is small (< 5% per day) because Tandem's Bluetooth protocol is energy-efficient. Exempt GlycemicGPT from battery optimization anyway -- Settings → Apps → GlycemicGPT → Battery → Unrestricted (the exact path varies by phone; some put it under Settings → Battery → Battery optimization). Without the exemption, Android is free to refuse to restart monitoring after a reboot or a disconnect, and on Android 15 it can also stop background work after a few hours. When that happens the app posts a **"Monitoring not running"** notification instead of failing quietly -- open the app and it will reconnect. Samsung, Xiaomi, Huawei and OnePlus phones are the strictest here; they often need the app added to a separate "never sleeping apps" or "protected apps" list as well.
+- **Battery and Bluetooth:** the app stays connected to your pump in the background, which uses some battery. On most phones the impact is small (< 5% per day) because Tandem's Bluetooth protocol is energy-efficient.
+- **Battery optimization:** exempt GlycemicGPT anyway -- Settings → Apps → GlycemicGPT → Battery → Unrestricted (the exact path varies by phone; some put it under Settings → Battery → Battery optimization). This is about your phone leaving the app's process alone rather than about permissions: Samsung, Xiaomi, Huawei and OnePlus are the aggressive ones, and they often need the app added to a separate "never sleeping apps" or "protected apps" list too. Pump monitoring restarts after a reboot without the exemption, so this is insurance against your phone killing the app between reconnects, not a requirement for it to work.
+- **If monitoring stops:** when Android refuses to let monitoring run, the app posts a **"Monitoring not running"** notification rather than going quiet. Open the app and it reconnects. Pump monitoring itself has no time limit. Alert delivery and the watch chat relay are a different kind of background work, and Android 15 caps that at a few hours at a stretch, so those can stop on their own and are restarted the next time you open the app.
 - **No insulin delivery:** the app is read-only. It does not deliver bolus, change basal rates, or modify any pump setting. See [What This Software Is and Isn't](../concepts/what-this-software-is-and-isnt.md) for the project's monitoring-only stance.
 - **Single device pairing:** Tandem pumps allow only one Bluetooth connection at a time. If your pump is already paired with another app (the official t:connect app, for example), unpair it first -- only one phone can be connected.

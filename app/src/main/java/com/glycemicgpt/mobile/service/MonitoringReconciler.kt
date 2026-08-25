@@ -195,9 +195,10 @@ class MonitoringReconciler @Inject constructor(
  * tell apart from the back of the stack through [ActivityManager.getMyMemoryState] alone, and the
  * cost of the two mistakes is not symmetric: a deferred start is retried on the next trigger,
  * whereas a refused one throws [android.app.ForegroundServiceStartNotAllowedException] at a
- * background caller. An app that is genuinely visible reports `IMPORTANCE_FOREGROUND`, so the case
- * this gives up is narrow. Widen it only with evidence from the platform's actual decision, not
- * from the importance constant's name.
+ * background caller. An app the user is currently interacting with reports `IMPORTANCE_FOREGROUND`,
+ * so the case this gives up is the narrower one: visible but not interactive, such as an activity
+ * behind another window or a non-focused pane in multi-window. Widen it only with evidence from the
+ * platform's actual decision, not from the importance constant's name.
  *
  * Its own class rather than two private helpers on [MonitoringReconciler] because it is the one
  * part of the decision that reads live platform state -- which makes it the part a test has to be
