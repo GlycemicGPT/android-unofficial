@@ -130,26 +130,31 @@ When a new GlycemicGPT release ships, you'll see a stale-version banner in the a
 
 The app does not auto-update -- there's no Play Store distribution today. F-Droid and Play Store distribution are on the roadmap.
 
-### Going back to an older version erases your local data
+### Going back to an older version can erase your local data
 
-> **Read this before you roll back.** Rolling back to an older release will wipe the app's local database: your on-phone pump history, the alerts it has recorded, anything still queued to upload, and the raw pump records the app keeps so it can rebuild readings without asking the pump again. Nothing asks you first, and there is no undo.
+> **Read this before you roll back.** A rollback can wipe the app's local database: your on-phone pump history, the alerts it has recorded, anything still queued to upload, and the raw pump records the app keeps so it can rebuild readings without asking the pump again. One of the two ways to roll back always wipes it; the other depends on which release you land on. Nothing asks you first, and there is no undo.
 >
 > Data already uploaded to your platform is safe -- this only affects what's stored on the phone.
 
-You won't hit this by accident. Android refuses to install an older release over a newer one: the install fails, and nothing happens to your data. Getting there takes one of two deliberate steps, and both lose it.
+You won't hit this by accident. Android refuses to install an older release over a newer one: the install fails, and nothing happens to your data. Getting there takes one of two deliberate steps.
 
-- **Uninstalling the app first**, then installing the older APK. The uninstall deletes everything the app stored, right then -- before the older version has run at all.
-- **Forcing the downgrade** with `adb install -d`, which keeps the app's data through the install. The older app then deletes the database the first time it opens it.
+- **Uninstalling the app first**, then installing the older APK. This one always loses the data. The uninstall deletes everything the app stored, right then -- before the older version has run at all.
+- **Forcing the downgrade** with `adb install -d`, which keeps the app's data through the install. What happens to it next is up to the release you rolled back to.
 
-Why that second one happens: each release ships a database layout, and the app knows how to move an older layout forward but not a newer one backward. The older build can't read the newer database, so it deletes it and starts an empty one. The install itself does nothing to your data -- the first launch does. By the time you see the app running, it's already gone.
+Why the second one varies: each release ships a database layout, and the app knows how to move an older layout forward but not a newer one backward. The older build meets a database it can't read, and what it does then depends on which release it is:
+
+- **0.14.0 and earlier** delete it and start an empty one. The install itself does nothing to your data -- the first launch does. By the time you see the app running, it's already gone.
+- **Anything newer than 0.14.0** refuses to open it instead. The app won't start, and your data is still sitting on the phone.
+
+Not every release changes the layout, so a rollback between two that share one loses nothing -- though nothing on the outside tells you which those are.
 
 Going forward is always safe -- installing a newer release keeps everything.
 
 If you need to roll back anyway:
 
 1. Let the app finish syncing first, so your platform has the data (check the sync icon on the home screen -- see [The App Status Icons](./status-icons.md))
-2. Expect the phone to start with an empty local history and refill it from the pump on the next connection. Pumps only retain a limited window of history, so anything older than that window is not coming back to the phone.
-3. If instead the older app won't start at all, that release refuses a database it can't read rather than deleting it -- your data is still on the phone. Reinstall the release you came from to get at it again.
+2. If you land on 0.14.0 or older, expect the phone to start with an empty local history and refill it from the pump on the next connection. Pumps only retain a limited window of history, so anything older than that window is not coming back to the phone.
+3. If the older app won't start at all, that is the refusal rather than a crash to chase -- your data is still on the phone. Reinstall the release you came from to get at it again.
 
 ## A few notes
 
