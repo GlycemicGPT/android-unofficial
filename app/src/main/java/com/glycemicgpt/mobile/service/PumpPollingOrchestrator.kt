@@ -911,12 +911,20 @@ class PumpPollingOrchestrator @Inject constructor(
             // holds nothing in between (a purged window, a shifted index range), and that leading
             // gap is not the batch's to justify.
             //
-            // Both failure shapes the reviews found land here: a driver that hands over a batch
-            // with a hole in it, and a single garbage sequence number from a misframed packet
-            // that would otherwise park the cursor near Int.MAX_VALUE, permanently. Failing is
-            // the recoverable direction — the cursor stays put, the batch is re-fetched, and the
-            // failure reports on the slow loop's ladder — because a cursor that has run ahead
-            // cannot be walked back.
+            // What this catches is a batch that spans more sequences than it has records to
+            // account for: a hole in the middle of a driver's answer, or a garbage index sitting
+            // alongside the real records it came in with. Failing is the recoverable direction —
+            // the cursor stays put, the batch is re-fetched, and the failure reports on the slow
+            // loop's ladder — because a cursor that has run ahead cannot be walked back.
+            //
+            // What it cannot catch is a batch that is NOTHING BUT a garbage index: one record
+            // spans zero sequences, so the arithmetic is satisfied no matter how far above the
+            // cursor it sits, and there is no bound to apply here that a legitimate leading gap
+            // would not also trip. That case belongs to the drivers, which know the window they
+            // asked the pump for and refuse an answer from outside it — Tandem in
+            // `TandemBleDriver.fetchHistoryLogs`, Medtronic in `HistoryReader.readRecordsInRange`.
+            // This check is the cross-driver backstop for the shapes a window bound still lets
+            // through, not a substitute for one.
             val batchMinSeq = records.minOf { it.sequenceNumber }
             val advanceFrom = maxOf(lastSequenceNumber, batchMinSeq - 1)
             val sequencesPassed = batchMaxSeq.toLong() - advanceFrom.toLong()

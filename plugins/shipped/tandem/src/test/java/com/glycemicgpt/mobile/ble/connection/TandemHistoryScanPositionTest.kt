@@ -301,4 +301,35 @@ class TandemHistoryScanPositionTest {
 
         assertEquals(firstStart, starts.first())
     }
+
+    @Test
+    fun `a range that ends below the first usable index promotes nothing either`() = runTest {
+        // Get the scan off its starting index first, so a rewind is visible.
+        val starts = captureFetchStarts()
+        driver.getHistoryLogs(sinceSequence = 0)
+        driver.acknowledgeHistoryLogs()
+        val acknowledged = starts.first() + 1
+
+        // The other shape of "the pump holds nothing": a well-formed range that is entirely below
+        // the first index this driver may request. `firstSeq = lastSeq = 0` satisfies
+        // `lastSeq >= firstSeq`, so it used to fall through to the scan -- which then requested no
+        // window at all, because the window starts at index 1 -- and still proposed a position.
+        coEvery { connectionManager.sendStatusRequest(any(), any(), any()) } returns
+            historyLogStatusCargo(firstIndex = 0, lastIndex = 0)
+        starts.clear()
+        val empty = driver.getHistoryLogs(sinceSequence = 0)
+        assertEquals(emptyList<Int>(), empty.getOrThrow().map { it.sequenceNumber })
+        assertEquals("no window may be requested for a range this driver cannot read", 0, starts.size)
+
+        // The caller acknowledges an empty answer -- there was nothing to persist. That must not
+        // promote a position, and in particular must not drag the scan back to the start of a
+        // window this call never requested.
+        driver.acknowledgeHistoryLogs()
+        coEvery { connectionManager.sendStatusRequest(any(), any(), any()) } returns
+            historyLogStatusCargo(firstIndex = 1, lastIndex = 1_000)
+        starts.clear()
+        driver.getHistoryLogs(sinceSequence = 0)
+
+        assertEquals(acknowledged, starts.first())
+    }
 }
