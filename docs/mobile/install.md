@@ -130,8 +130,23 @@ When a new GlycemicGPT release ships, you'll see a stale-version banner in the a
 
 The app does not auto-update -- there's no Play Store distribution today. F-Droid and Play Store distribution are on the roadmap.
 
+### Going back to an older version erases your local data
+
+> **Read this before you roll back.** Installing a release older than the one you're on today will wipe the app's local database: your on-phone pump history, the alerts it has recorded, anything still queued to upload, and the raw pump records the app keeps so it can rebuild readings without asking the pump again. Android does the wipe as part of the install, without asking, and there is no undo.
+>
+> Data already uploaded to your platform is safe -- this only affects what's stored on the phone.
+
+Why it happens: each release ships a database layout, and the app knows how to move an older layout forward but not a newer one backward. The older APK you install has no way to read the newer database, and the version you'd be going back to handles that by deleting it.
+
+Going forward is always safe -- installing a newer release keeps everything.
+
+If you need to roll back anyway:
+
+1. Let the app finish syncing first, so your platform has the data (check the sync icon on the home screen -- see [The App Status Icons](./status-icons.md))
+2. Expect the phone to start with an empty local history and refill it from the pump on the next connection. Pumps only retain a limited window of history, so anything older than that window is not coming back to the phone.
+
 ## A few notes
 
-- **Battery and Bluetooth:** the app stays connected to your pump in the background, which uses some battery. On most phones the impact is small (< 5% per day) because Tandem's Bluetooth protocol is energy-efficient. If you see your phone disconnecting from the pump frequently, your phone's battery optimization may be killing the app -- exempt GlycemicGPT in Settings → Battery → Battery optimization.
+- **Battery and Bluetooth:** the app stays connected to your pump in the background, which uses some battery. On most phones the impact is small (< 5% per day) because Tandem's Bluetooth protocol is energy-efficient. Exempt GlycemicGPT from battery optimization anyway -- Settings → Apps → GlycemicGPT → Battery → Unrestricted (the exact path varies by phone; some put it under Settings → Battery → Battery optimization). Without the exemption, Android is free to refuse to restart monitoring after a reboot or a disconnect, and on Android 15 it can also stop background work after a few hours. When that happens the app posts a **"Monitoring not running"** notification instead of failing quietly -- open the app and it will reconnect. Samsung, Xiaomi, Huawei and OnePlus phones are the strictest here; they often need the app added to a separate "never sleeping apps" or "protected apps" list as well.
 - **No insulin delivery:** the app is read-only. It does not deliver bolus, change basal rates, or modify any pump setting. See [What This Software Is and Isn't](../concepts/what-this-software-is-and-isnt.md) for the project's monitoring-only stance.
 - **Single device pairing:** Tandem pumps allow only one Bluetooth connection at a time. If your pump is already paired with another app (the official t:connect app, for example), unpair it first -- only one phone can be connected.
