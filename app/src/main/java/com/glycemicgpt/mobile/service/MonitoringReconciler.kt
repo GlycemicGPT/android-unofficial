@@ -186,10 +186,18 @@ class MonitoringReconciler @Inject constructor(
 
 /**
  * Whether the platform would currently accept a foreground-service start from a caller with no
- * exemption of its own. Two ways to qualify, mirroring what the platform itself checks: the
- * process is already at foreground-ish importance (a visible or foreground-service process may
- * start one), or the app is allowlisted out of battery optimizations, which carries a standing
- * exemption.
+ * exemption of its own. Two ways to qualify: the process is at `IMPORTANCE_FOREGROUND_SERVICE` or
+ * better — top, foreground, or already running a foreground service — or the app is allowlisted out
+ * of battery optimizations, which carries a standing exemption.
+ *
+ * The importance threshold is deliberately narrower than the platform's own rule, which also lets
+ * some merely-visible processes start a service. `IMPORTANCE_VISIBLE` covers states this app cannot
+ * tell apart from the back of the stack through [ActivityManager.getMyMemoryState] alone, and the
+ * cost of the two mistakes is not symmetric: a deferred start is retried on the next trigger,
+ * whereas a refused one throws [android.app.ForegroundServiceStartNotAllowedException] at a
+ * background caller. An app that is genuinely visible reports `IMPORTANCE_FOREGROUND`, so the case
+ * this gives up is narrow. Widen it only with evidence from the platform's actual decision, not
+ * from the importance constant's name.
  *
  * Its own class rather than two private helpers on [MonitoringReconciler] because it is the one
  * part of the decision that reads live platform state -- which makes it the part a test has to be
