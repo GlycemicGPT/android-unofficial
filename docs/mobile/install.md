@@ -132,11 +132,16 @@ The app does not auto-update -- there's no Play Store distribution today. F-Droi
 
 ### Going back to an older version erases your local data
 
-> **Read this before you roll back.** Going back to a release older than the one you're on today will wipe the app's local database: your on-phone pump history, the alerts it has recorded, anything still queued to upload, and the raw pump records the app keeps so it can rebuild readings without asking the pump again. Nothing asks you first, and there is no undo.
+> **Read this before you roll back.** Rolling back to an older release will wipe the app's local database: your on-phone pump history, the alerts it has recorded, anything still queued to upload, and the raw pump records the app keeps so it can rebuild readings without asking the pump again. Nothing asks you first, and there is no undo.
 >
 > Data already uploaded to your platform is safe -- this only affects what's stored on the phone.
 
-Why it happens: each release ships a database layout, and the app knows how to move an older layout forward but not a newer one backward. The wipe isn't part of the install itself. It happens the first time the older app opens a database newer than the layout it was built for: it can't read it, so it deletes it and starts an empty one. By the time you notice the app is running, the data is already gone.
+You won't hit this by accident. Android refuses to install an older release over a newer one: the install fails, and nothing happens to your data. Getting there takes one of two deliberate steps, and both lose it.
+
+- **Uninstalling the app first**, then installing the older APK. The uninstall deletes everything the app stored, right then -- before the older version has run at all.
+- **Forcing the downgrade** with `adb install -d`, which keeps the app's data through the install. The older app then deletes the database the first time it opens it.
+
+Why that second one happens: each release ships a database layout, and the app knows how to move an older layout forward but not a newer one backward. The older build can't read the newer database, so it deletes it and starts an empty one. The install itself does nothing to your data -- the first launch does. By the time you see the app running, it's already gone.
 
 Going forward is always safe -- installing a newer release keeps everything.
 
@@ -144,11 +149,13 @@ If you need to roll back anyway:
 
 1. Let the app finish syncing first, so your platform has the data (check the sync icon on the home screen -- see [The App Status Icons](./status-icons.md))
 2. Expect the phone to start with an empty local history and refill it from the pump on the next connection. Pumps only retain a limited window of history, so anything older than that window is not coming back to the phone.
+3. If instead the older app won't start at all, that release refuses a database it can't read rather than deleting it -- your data is still on the phone. Reinstall the release you came from to get at it again.
 
 ## A few notes
 
 - **Battery and Bluetooth:** the app stays connected to your pump in the background, which uses some battery. On most phones the impact is small (< 5% per day) because Tandem's Bluetooth protocol is energy-efficient.
 - **Battery optimization:** exempt GlycemicGPT anyway -- Settings → Apps → GlycemicGPT → Battery → Unrestricted (the exact path varies by phone; some put it under Settings → Battery → Battery optimization). This is about your phone leaving the app's process alone rather than about permissions: Samsung, Xiaomi, Huawei and OnePlus are the aggressive ones, and they often need the app added to a separate "never sleeping apps" or "protected apps" list too. Pump monitoring restarts after a reboot without the exemption, so this is insurance against your phone killing the app between reconnects, not a requirement for it to work.
-- **If monitoring stops:** when Android refuses to let monitoring run, the app posts a **"Monitoring not running"** notification rather than going quiet. Open the app and it reconnects. Pump monitoring itself has no time limit. Alert delivery and the watch chat relay are a different kind of background work, and Android 15 caps that at a few hours at a stretch, so those can stop on their own and are restarted the next time you open the app.
+- **If a start is refused:** when Android refuses to let pump monitoring or alert delivery start, the app posts a **"Monitoring not running"** notification rather than going quiet. Open the app and pump monitoring reconnects.
+- **The Android 15 time limit:** pump monitoring has no time limit -- it runs as a connected-device service, which Android doesn't cap. Alert delivery and the watch chat relay are a different kind of background work, and Android 15 allows that kind roughly six hours of background running per day; opening the app resets that clock. Once alert delivery has been stopped, though, it doesn't come back just because you opened the app -- it restarts on the next reboot, when you sign in again, or when you open Settings. The watch relay restarts on its own with the next message from the watch.
 - **No insulin delivery:** the app is read-only. It does not deliver bolus, change basal rates, or modify any pump setting. See [What This Software Is and Isn't](../concepts/what-this-software-is-and-isnt.md) for the project's monitoring-only stance.
 - **Single device pairing:** Tandem pumps allow only one Bluetooth connection at a time. If your pump is already paired with another app (the official t:connect app, for example), unpair it first -- only one phone can be connected.
