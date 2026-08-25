@@ -179,11 +179,22 @@ class WearChatRelayServiceTimeoutTest {
             insidePromotion.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
         )
 
+        // Counted down on the watch-message thread immediately before it calls startWork, so the
+        // negative assertion below is waiting on a thread that has actually reached the contended
+        // call. Without it, a thread still queued by the scheduler would satisfy the assertion
+        // without ever contending for anything, and the test would keep passing if the lock were
+        // removed outright.
+        val watchEntering = CountDownLatch(1)
         val watchMessage = Thread {
+            watchEntering.countDown()
             service.startWork()
             workStarted.countDown()
         }
         watchMessage.start()
+        assertTrue(
+            "the watch message thread never started",
+            watchEntering.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
 
         assertFalse(
             "a watch message mutated the work counter while the start command was mid-promotion",
@@ -194,6 +205,10 @@ class WearChatRelayServiceTimeoutTest {
         releasePromotion.countDown()
         startCommand.join(JOIN_TIMEOUT_MILLIS)
         watchMessage.join(JOIN_TIMEOUT_MILLIS)
+        // join() with a timeout returns silently when it expires, so the joins above prove nothing
+        // on their own: a thread still parked on the lock would sail through to the assertions.
+        assertFalse("the start command never finished", startCommand.isAlive)
+        assertFalse("the watch message never finished", watchMessage.isAlive)
 
         assertTrue(
             "the watch message never got the lock back",
