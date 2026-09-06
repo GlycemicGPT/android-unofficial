@@ -245,11 +245,17 @@ class TandemBleDriver @Inject constructor(
             range.firstSeq, range.lastSeq, range.lastSeq - range.firstSeq + 1,
             windowStart, fetchStart, fetchStart != windowStart, sinceSequence, fullSync)
 
-        if (range.lastSeq < range.firstSeq) {
+        if (range.lastSeq < windowStart) {
             // Nothing to serve, and nothing proven, so there is nothing to promote. Clearing the
             // proposal matters because the caller acknowledges an empty answer: an earlier
             // fetch's unacknowledged position left standing here would be promoted on the
             // strength of a window this call never even requested.
+            //
+            // Compared against `windowStart` rather than `range.firstSeq`, because the scan starts
+            // at `windowStart` and that is clamped up to [FIRST_USABLE_HISTORY_INDEX]. A pump
+            // reporting `firstSeq = lastSeq = 0` holds nothing this driver may fetch, yet it
+            // passes a `lastSeq < firstSeq` test; the loop below would then not run at all and the
+            // fall-through would still propose a position for the unrequested window.
             pendingHistoryIndex = null
             return Result.success(emptyList())
         }

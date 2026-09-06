@@ -201,6 +201,35 @@ class HistoryReaderTest {
     }
 
     @Test
+    fun `readRecordsInRange refuses a page carrying a sequence outside the requested window`() {
+        // The record decodes perfectly; it just answers a sequence nobody asked for, which is what a
+        // misframed page looks like from here. The caller's backfill cursor advances to the highest
+        // sequence it is handed and only ever moves forward, so a single record at Int.MAX_VALUE - 5
+        // would park it above anything the pump will ever hold and end history collection for good.
+        // Nothing downstream can catch this one: a lone record spans no sequences, so the
+        // orchestrator's span check is satisfied by it, and the requested range is the only bound
+        // that exists. Failing leaves the cursors put and re-reads the window.
+        val two = TwoSidedSession()
+        val link = FakeGattLink()
+        link.reads[features] = two.pumpEncrypt(featuresPlain)
+        val outOfWindow = le16(0x0099) + le32(Int.MAX_VALUE - 5) + le16(0) +
+            hex("01" + "0a0000ff" + "050000ff" + "55")
+        link.onWrite = { characteristic, value ->
+            if (characteristic == racp && value.size > 3 &&
+                value[0] == HistoryReader.REQUEST_REPORT_WITHIN_RANGE_PREFIX[0]
+            ) {
+                PduFramer.fragment(outOfWindow).forEach { emit(data, two.pumpEncrypt(it)) }
+                emit(racp, HistoryReader.EXPECTED_REPORT_SUCCESS)
+            }
+        }
+
+        var result: Result<List<com.glycemicgpt.mobile.domain.model.HistoryLogRecord>>? = null
+        HistoryReader(link, two.server).readRecordsInRange(100, 120) { result = it }
+
+        assertTrue("a page answering outside its window must not be handed over", result!!.isFailure)
+    }
+
+    @Test
     fun `readRecordsInRange recovers a validated unterminated final record`() {
         // A record whose plaintext is an exact PDU multiple has no short terminator (the documented
         // reassembler ambiguity) -- live 780G reads hit this on real records. The pending fragments
