@@ -5,10 +5,10 @@ import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.local.GlucoseRangeStore
 import com.glycemicgpt.mobile.data.local.SafetyLimitsStore
 import com.glycemicgpt.mobile.data.local.dao.AlertDao
-import com.glycemicgpt.mobile.data.local.dao.RawHistoryLogDao
 import com.glycemicgpt.mobile.data.local.entity.AlertEntity
 import com.glycemicgpt.mobile.data.network.NetworkMonitor
 import com.glycemicgpt.mobile.data.network.NetworkStatus
+import com.glycemicgpt.mobile.data.repository.HistoryBackfillWriter
 import com.glycemicgpt.mobile.data.repository.PumpDataRepository
 import com.glycemicgpt.mobile.data.repository.SyncQueueEnqueuer
 import com.glycemicgpt.mobile.domain.model.CgmReading
@@ -78,13 +78,14 @@ class AlertRelayFloorDivergenceTest {
             mockk<PumpDriver>(relaxed = true),
             mockk<PumpDataRepository>(relaxed = true),
             mockk<SyncQueueEnqueuer>(relaxed = true),
-            mockk<RawHistoryLogDao>(relaxed = true),
+            mockk<HistoryBackfillWriter>(relaxed = true),
             wearDataSender,
             mockk<GlucoseRangeStore>(relaxed = true),
             mockk<SafetyLimitsStore>(relaxed = true),
             mockk<HistoryLogParser>(relaxed = true),
             appSettingsStore,
             floor,
+            PollLoopHealthTracker(),
         )
     }
 

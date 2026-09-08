@@ -432,9 +432,28 @@ class CgmHistoryParserTest {
     }
 
     @Test
-    fun `parseHistoryLogStreamCargo rejects records with invalid event types`() {
+    fun `parseHistoryLogStreamCargo keeps records whose event type this build does not know`() {
         val record = buildStreamRecord(1000, 500_000_000L, 60000, ByteArray(16))
+
         val result = StatusResponseParser.parseHistoryLogStreamCargo(record)
-        assertTrue(result.isEmpty())
+
+        // These used to be dropped, which put a hole in the middle of a batch: the backfill
+        // cursor advances to max(sequenceNumber) of what comes back, so the record was stepped
+        // over permanently AND its raw bytes were never stored, leaving nothing for a later
+        // build to re-derive from (GLY-250). Unknown types derive nothing -- every extractor
+        // filters on the ids it knows -- so keeping them costs one raw row.
+        assertEquals(1, result.size)
+        assertEquals(1000, result[0].sequenceNumber)
+        assertEquals(60000, result[0].eventTypeId)
+        assertEquals(26, java.util.Base64.getDecoder().decode(result[0].rawBytesB64).size)
+    }
+
+    @Test
+    fun `parseHistoryLogStreamCargo rejects records with a zero index`() {
+        // A zero record index is padding, not a record: it has no place in the pump's index
+        // space, so there is no gap for a cursor to step over.
+        val record = buildStreamRecord(0, 500_000_000L, 16, ByteArray(16))
+
+        assertTrue(StatusResponseParser.parseHistoryLogStreamCargo(record).isEmpty())
     }
 }

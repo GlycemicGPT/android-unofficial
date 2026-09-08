@@ -2,6 +2,7 @@ package com.glycemicgpt.mobile.data.local.dao
 
 import androidx.room.Dao
 import androidx.room.Insert
+import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.glycemicgpt.mobile.data.local.entity.SyncQueueEntity
 import kotlinx.coroutines.flow.Flow
@@ -15,6 +16,18 @@ interface SyncDao {
     /** Insert a batch in one transaction -- all rows land or none do. */
     @Insert
     suspend fun enqueueAll(entities: List<SyncQueueEntity>)
+
+    /**
+     * Insert a batch, skipping rows whose [SyncQueueEntity.dedupeKey] is already queued
+     * (GLY-250). Used by the history backfill, whose batches can legitimately be re-processed
+     * after a failure or a reconnect: without this the replay queued a second upload for every
+     * bolus and basal rate in the batch.
+     *
+     * Rows with a null key are never skipped -- SQLite treats NULLs in a unique index as
+     * distinct -- so this is safe for anything the live poll loops enqueue too.
+     */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun enqueueAllIgnoringDuplicates(entities: List<SyncQueueEntity>)
 
     @Query(
         """

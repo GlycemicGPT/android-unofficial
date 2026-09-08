@@ -18,6 +18,8 @@ import io.mockk.mockk
 import io.mockk.slot
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
@@ -119,6 +121,90 @@ class SyncQueueEnqueuerTest {
         coEvery { syncDao.enqueueAll(any()) } throws RuntimeException("disk full")
 
         enqueuer.enqueueIoB(IoBReading(iob = 2.5f, timestamp = Instant.now()))
+    }
+
+    // -- history-backfill rows (GLY-250) ---------------------------------------
+
+    private val backfillBolus = BolusEvent(
+        units = 3.0f,
+        isAutomated = false,
+        isCorrection = false,
+        timestamp = Instant.ofEpochMilli(1_700_000_000_000L),
+    )
+    private val backfillBasal = BasalReading(
+        rate = 0.8f,
+        isAutomated = true,
+        activityMode = PumpActivityMode.NONE,
+        timestamp = Instant.ofEpochMilli(1_700_000_020_000L),
+    )
+
+    @Test
+    fun `backfill rows are built, not inserted -- the caller's transaction inserts them`() = runTest {
+        val built = enqueuer.buildBackfillRows(listOf(backfillBolus), listOf(backfillBasal))
+
+        assertEquals(2, built.rows.size)
+        assertTrue(built.complete)
+        coVerify(exactly = 0) { syncDao.enqueueAll(any()) }
+        coVerify(exactly = 0) { syncDao.enqueueAllIgnoringDuplicates(any()) }
+    }
+
+    @Test
+    fun `backfill rows carry a dedupe key, identical for the same event and distinct across events`() = runTest {
+        val first = enqueuer.buildBackfillRows(listOf(backfillBolus), listOf(backfillBasal)).rows
+        val second = enqueuer.buildBackfillRows(listOf(backfillBolus), listOf(backfillBasal)).rows
+
+        // Re-processing a batch must not queue its uploads twice; the key is what the unique
+        // index collapses on, so it has to be stable across calls and per event.
+        assertEquals(first.map { it.dedupeKey }, second.map { it.dedupeKey })
+        assertEquals(2, first.mapNotNull { it.dedupeKey }.toSet().size)
+    }
+
+    @Test
+    fun `a bolus differing only in units gets a different dedupe key`() = runTest {
+        val a = enqueuer.buildBackfillRows(listOf(backfillBolus), emptyList()).rows.single()
+        val b = enqueuer.buildBackfillRows(
+            listOf(backfillBolus.copy(units = 3.5f)),
+            emptyList(),
+        ).rows.single()
+
+        // Two boluses at the same instant with different doses are two events, not one.
+        assertEquals(a.eventTimestampMs, b.eventTimestampMs)
+        assertTrue(a.dedupeKey != b.dedupeKey)
+    }
+
+    @Test
+    fun `live poll rows carry no dedupe key, so their insert-always semantics are unchanged`() = runTest {
+        val slot = slot<List<SyncQueueEntity>>()
+        coEvery { syncDao.enqueueAll(capture(slot)) } returns Unit
+
+        enqueuer.enqueueBoluses(listOf(backfillBolus))
+
+        assertNull(slot.captured.single().dedupeKey)
+    }
+
+    @Test
+    fun `nothing to upload is complete, not a failure`() = runTest {
+        every { authTokenStore.isBackendConfigured() } returns false
+
+        val built = enqueuer.buildBackfillRows(listOf(backfillBolus), listOf(backfillBasal))
+
+        // A BLE-only device has no destination, which is not the same as failing to build the
+        // rows -- the caller must still be able to write the batch off as fully processed.
+        assertTrue(built.rows.isEmpty())
+        assertTrue(built.complete)
+    }
+
+    @Test
+    fun `a failed build reports incomplete instead of throwing or looking empty`() = runTest {
+        every { authTokenStore.isBackendConfigured() } throws RuntimeException("keystore flake")
+
+        val built = enqueuer.buildBackfillRows(listOf(backfillBolus), listOf(backfillBasal))
+
+        // Silently returning an empty list here is how a batch commits with its uploads missing
+        // and its raw rows marked done -- permanently absent from the backend, with nothing left
+        // recording it. The caller needs to see the difference.
+        assertTrue(built.rows.isEmpty())
+        assertFalse(built.complete)
     }
 
     @Test

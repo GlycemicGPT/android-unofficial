@@ -178,9 +178,12 @@ class BackendSyncManager @Inject constructor(
 
     internal suspend fun purgeUndeliverable() {
         val purged = syncDao.deleteAll()
-        // The raw upload copies are undeliverable too; only the max-sequence row survives as
-        // the poller's resume anchor. Without this a BLE-only device would grow the raw table
-        // forever -- nothing ever marks its rows sent, and cleanup() only deletes sent rows.
+        // The raw upload copies are undeliverable too. Without this a BLE-only device would grow
+        // the raw table forever -- nothing ever marks its rows sent, and cleanup() only deletes
+        // sent rows. Two kinds of row survive it, for different reasons: the highest sequence
+        // (historical, and harmless now that the resume anchor lives in its own table), and any
+        // row still owing derived records, which is the input a re-derivation pass rebuilds from
+        // rather than dead weight (GLY-250).
         val rawPurged = rawHistoryLogDao.deleteAllButMaxSequence()
         if (purged > 0 || rawPurged > 0) {
             Timber.i(

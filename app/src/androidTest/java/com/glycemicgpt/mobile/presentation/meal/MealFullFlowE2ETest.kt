@@ -3,7 +3,12 @@ package com.glycemicgpt.mobile.presentation.meal
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.view.View
+import android.view.inputmethod.InputMethodManager
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.InternalComposeUiApi
+import androidx.compose.ui.platform.ViewRootForTest
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -13,11 +18,12 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextReplacement
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.test.core.app.ApplicationProvider
-import androidx.test.espresso.Espresso
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.remote.GlycemicGptApi
@@ -100,7 +106,7 @@ class MealFullFlowE2ETest {
         // overlays the inline Save button; dismiss it (as a user would) and scroll the
         // button into view so the click lands on the button, not the IME or the void
         // below a short screen's fold.
-        dismissKeyboard()
+        dismissKeyboard(nextTarget = "meal_correct_save")
         tapInScroll("meal_correct_save")
         awaitTag("meal_corrected_note")
 
@@ -108,7 +114,8 @@ class MealFullFlowE2ETest {
         tapInScroll("meal_save_common_button")
         awaitTag("meal_save_common_name_input")
         compose.onNodeWithTag("meal_save_common_name_input").performTextInput("Chicken Burrito")
-        dismissKeyboard() // same IME-overlay guard before the dialog's confirm button
+        // Same IME-overlay guard before the dialog's confirm button.
+        dismissKeyboard(nextTarget = "meal_save_common_confirm")
         compose.onNodeWithTag("meal_save_common_confirm").performClick()
         awaitTag("meal_saved_common_confirmation")
         check(api.commonFoods.isNotEmpty()) { "save-as-common-food never reached the API" }
@@ -210,8 +217,63 @@ class MealFullFlowE2ETest {
 
     private fun runOnUi(block: () -> Unit) = compose.runOnUiThread(block)
 
-    /** Hide the soft keyboard and wait for it to be gone, so it can't overlay a tap target. */
-    private fun dismissKeyboard() = Espresso.closeSoftKeyboard()
+    /**
+     * Drop the text-input focus and hide the soft keyboard, then wait until it is really gone,
+     * so it can't overlay the tap on [nextTarget].
+     *
+     * Deliberately not `Espresso.closeSoftKeyboard()`, which this used to call. That routes
+     * through Espresso's RootViewPicker, which refuses to act until the root it picked reports
+     * window focus -- and the IME we are asking it to dismiss is exactly what can hold that
+     * focus. When the emulator's IME window is focusable, the picker spins for its 10-second
+     * budget and throws RootViewWithoutFocusException (has-window-focus=false). That is the
+     * failure that made this test deterministically red in CI, and this call was the whole
+     * instrumented suite's only use of Espresso, which is why nothing else failed with it.
+     *
+     * Clearing focus and asking the insets controller to hide the IME need no window focus.
+     * Both are done on the window that actually owns [nextTarget] -- the save-as-common-food
+     * dialog is a separate window from the activity, and only its own window can hide or
+     * report its IME. The wait keys on the input session and the IME insets rather than on
+     * focus, so a device that never raised the keyboard falls straight through.
+     */
+    private fun dismissKeyboard(nextTarget: String) {
+        val root = rootViewOf(nextTarget)
+        val imm = context.getSystemService(InputMethodManager::class.java)
+        runOnUi {
+            root.clearFocus()
+            imm.hideSoftInputFromWindow(root.windowToken, 0)
+            ViewCompat.getWindowInsetsController(root)?.hide(WindowInsetsCompat.Type.ime())
+        }
+        var accepting = true
+        var imeVisible = true
+        try {
+            compose.waitUntil(IME_HIDE_TIMEOUT_MS) {
+                compose.runOnUiThread {
+                    accepting = imm.isAcceptingText
+                    imeVisible = isImeVisible(root)
+                    !accepting && !imeVisible
+                }
+            }
+        } catch (timeout: ComposeTimeoutException) {
+            throw AssertionError(
+                "soft keyboard still up before tapping $nextTarget " +
+                    "(acceptingText=$accepting, imeInsetsVisible=$imeVisible)",
+                timeout,
+            )
+        }
+        compose.waitForIdle()
+    }
+
+    /**
+     * The Android view hosting [tag]'s composition -- i.e. the window it lives in, which for a
+     * node inside a Compose [androidx.compose.ui.window.Dialog] is the dialog's window, not the
+     * activity's. [ViewRootForTest] is Compose's own test-only seam onto that view.
+     */
+    @OptIn(InternalComposeUiApi::class)
+    private fun rootViewOf(tag: String): View =
+        (compose.onNodeWithTag(tag).fetchSemanticsNode().root as ViewRootForTest).view
+
+    private fun isImeVisible(view: View): Boolean =
+        ViewCompat.getRootWindowInsets(view)?.isVisible(WindowInsetsCompat.Type.ime()) == true
 
     /**
      * Scroll a node in the result/idle scroll column into view, then click it. The result
@@ -234,6 +296,11 @@ class MealFullFlowE2ETest {
             FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             bitmap.recycle()
         }
+    }
+
+    private companion object {
+        /** Generous enough for a slow emulator's IME hide animation, short enough to fail fast. */
+        const val IME_HIDE_TIMEOUT_MS = 10_000L
     }
 }
 

@@ -66,10 +66,31 @@ class HistoryReader(
      * All records with sequence number in [firstSeq]..[lastSeq] inclusive. A window the pump holds no
      * records for (the RACP "no records found" indication) is a successful empty list, not a failure
      * -- the gateway's paging walk relies on that to detect the oldest retained record.
+     *
+     * A record answering outside the requested range fails the whole page. The caller's durable
+     * backfill cursor advances to the highest sequence number it is handed and can only move
+     * forward, so one record that decodes to a bogus sequence would park it above anything the pump
+     * will ever hold and end history collection permanently. The requested range is the only bound
+     * available at this boundary, and the frame checks below cannot substitute for it: a misframed
+     * page can decode cleanly and still carry the wrong index. Refusing the page leaves the cursors
+     * where they are and re-reads the window.
      */
     fun readRecordsInRange(firstSeq: Int, lastSeq: Int, onResult: (Result<List<HistoryLogRecord>>) -> Unit) {
         val e2e = e2eFlagOr(onResult) ?: return
-        fetchRecords(rangeRequest(firstSeq, lastSeq), e2e, onResult)
+        fetchRecords(rangeRequest(firstSeq, lastSeq), e2e) { result ->
+            onResult(
+                result.mapCatching { records ->
+                    val outOfWindow = records.count { it.sequenceNumber !in firstSeq..lastSeq }
+                    if (outOfWindow > 0) {
+                        throw MedtronicReadException(
+                            "$outOfWindow of ${records.size} history record(s) answering sequences " +
+                                "$firstSeq..$lastSeq fell outside the requested window",
+                        )
+                    }
+                    records
+                },
+            )
+        }
     }
 
     /** Read the IDD Features E2E flag, routing a read/parse failure to [onResult]; null = abort. */

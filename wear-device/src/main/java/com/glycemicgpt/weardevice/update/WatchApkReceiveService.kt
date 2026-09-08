@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.ServiceInfo
+import android.os.Build
+import androidx.annotation.RequiresApi
+import com.glycemicgpt.weardevice.data.FgsTimeoutReporter
+import com.glycemicgpt.weardevice.data.ForegroundServiceStarter
 import com.glycemicgpt.weardevice.data.WearDataContract
 import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.Wearable
@@ -18,6 +22,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -62,6 +67,79 @@ class WatchApkReceiveService : WearableListenerService() {
     private val activePushCount = AtomicInteger(0)
     private val foregroundLock = Any()
 
+    override fun onCreate() {
+        super.onCreate()
+        // Open the timeout store now so [onTimeout], which has only seconds to run, never has
+        // to read a prefs file from disk.
+        FgsTimeoutReporter.init(applicationContext)
+    }
+
+    /**
+     * A `startService`/`startForegroundService` delivery, which for this service always carries
+     * nothing to do: APK pushes arrive over the GMS channel and land in [onChannelOpened], which
+     * does its own foreground promotion around the transfer it starts.
+     *
+     * It still has to be answered, and only one answer works. This service is exported (the Data
+     * Layer dispatches to it by intent filter) and declares `foregroundServiceType="dataSync"`, so
+     * anything on the watch can aim a `startForegroundService` at it -- and the platform then
+     * requires a matching `startForeground`. Inheriting the default `onStartCommand` misses the
+     * 30 s deadline and the process dies with `ForegroundServiceDidNotStartInTimeException`;
+     * simply calling `stopSelf` instead is *also* fatal, and faster -- the platform crashes a
+     * service that stops while it still owes a promotion. Both were reproduced on the phone side's
+     * twin of this service (`WearChatRelayService`) on an Android 16 emulator.
+     *
+     * So the obligation is discharged the only way that is not fatal: promote, then drop straight
+     * back out if no transfer is holding the promotion -- under the same [foregroundLock] a real
+     * push takes, which is what keeps this start command from demoting out from under one already
+     * under way. `stopSelf` is safe once the promotion is discharged, and does not destroy the
+     * service while GMS holds its binding.
+     *
+     * The promotion is unconditional, unlike [onChannelOpened]'s, which fires on the 0 -> 1
+     * transition. [activePushCount] counts transfers, not foreground state, and the two come apart
+     * as soon as a promotion is refused: a transfer whose [tryPromoteToForeground] was rejected
+     * leaves the counter at 1 with the service still in the background, and a counter-gated start
+     * command would then skip the one call that discharges the obligation. `startForeground` on a
+     * service that is already foreground just refreshes the same notification id, so promoting
+     * every time costs nothing.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        synchronized(foregroundLock) {
+            tryPromoteToForeground()
+            if (activePushCount.get() == 0) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+        }
+        stopSelf(startId)
+        return START_NOT_STICKY
+    }
+
+    /**
+     * The app's cumulative `dataSync` foreground-service budget (6 h per 24 h on Wear OS 5+) is
+     * spent while an APK transfer was in flight. Stop within the system's few-second window or
+     * it throws `RemoteServiceException` and kills the watch process.
+     *
+     * Dropping the foreground state -- not the cancellation -- is what actually ends the
+     * dataSync billing: a blocking `InputStream.read()` inside the transfer cannot be
+     * interrupted by cancelling its coroutine, which is what the receive watchdog is for. A
+     * half-received APK is never committed to PackageInstaller, and the phone re-pushes on the
+     * next update check, so nothing is persisted for resume.
+     */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        scope.coroutineContext.cancelChildren()
+        synchronized(foregroundLock) {
+            activePushCount.set(0)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
+        stopSelf()
+        FgsTimeoutReporter.recordTimeout(
+            component = FgsTimeoutReporter.COMPONENT_WATCH_APK_RECEIVE,
+            startId = startId,
+            fgsType = fgsType,
+        )
+    }
+
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         if (channel.path != WearDataContract.WATCH_APK_PUSH_CHANNEL) return
 
@@ -91,7 +169,14 @@ class WatchApkReceiveService : WearableListenerService() {
                 }
             } finally {
                 synchronized(foregroundLock) {
-                    if (activePushCount.decrementAndGet() == 0) {
+                    // <= 0, not == 0: [onTimeout] zeroes the counter out-of-band while this
+                    // transfer is still unwinding, so this decrement can land on an already-zero
+                    // counter. An exact-equality test would leave it negative and GMS keeps the
+                    // instance bound, so every later APK push would skip tryPromoteToForeground
+                    // and transfer (up to 100 MB) with no foreground protection. Same clamp the
+                    // phone relay's finishWork has.
+                    if (activePushCount.decrementAndGet() <= 0) {
+                        activePushCount.set(0)
                         stopForeground(STOP_FOREGROUND_REMOVE)
                     }
                 }
@@ -99,6 +184,13 @@ class WatchApkReceiveService : WearableListenerService() {
         }
     }
 
+    /**
+     * The narrower [ForegroundServiceStarter] catch only classifies the platform's own rejection
+     * types; this outer catch is the backstop the pre-GLY-246 code had (channel creation and
+     * notification build ran inside the same `catch (e: Exception)` as the promotion call), kept
+     * so an unexpected throw here still can't escape a `WearableListenerService` callback with no
+     * enclosing try/catch of its own.
+     */
     private fun tryPromoteToForeground() {
         try {
             val nm = getSystemService(NotificationManager::class.java)
@@ -116,9 +208,22 @@ class WatchApkReceiveService : WearableListenerService() {
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setOngoing(true)
                 .build()
-            startForeground(FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            ForegroundServiceStarter.promote(
+                this,
+                FOREGROUND_ID,
+                notification,
+                FgsTimeoutReporter.COMPONENT_WATCH_APK_RECEIVE,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
         } catch (e: Exception) {
-            Timber.w(e, "Failed to promote to foreground, continuing without protection")
+            Timber.e(e, "Unexpected failure promoting watch APK receive to foreground")
+            // Not recordForegroundStartRejected: everything this backstop catches came from the
+            // notification setup above, or is an exception type ForegroundServiceStarter does not
+            // classify -- neither is the platform refusing the start (PR #44 review).
+            FgsTimeoutReporter.recordForegroundSetupFailure(
+                FgsTimeoutReporter.COMPONENT_WATCH_APK_RECEIVE,
+                e,
+            )
         }
     }
 

@@ -4,10 +4,9 @@ import com.glycemicgpt.mobile.data.local.AppSettingsStore
 import com.glycemicgpt.mobile.data.local.GlucoseRangeStore
 import com.glycemicgpt.mobile.data.local.SafetyLimitsStore
 import com.glycemicgpt.mobile.domain.alerting.AlertTypes
-import com.glycemicgpt.mobile.data.local.dao.RawHistoryLogDao
 import com.glycemicgpt.mobile.domain.format.GlucoseFormat
 import com.glycemicgpt.mobile.domain.model.PumpActivityMode
-import com.glycemicgpt.mobile.data.local.entity.RawHistoryLogEntity
+import com.glycemicgpt.mobile.data.repository.HistoryBackfillWriter
 import com.glycemicgpt.mobile.data.repository.PumpDataRepository
 import com.glycemicgpt.mobile.data.repository.SyncQueueEnqueuer
 import com.glycemicgpt.mobile.domain.model.CgmReading
@@ -20,7 +19,9 @@ import com.glycemicgpt.mobile.wear.WearHistorySerializer
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -41,26 +42,49 @@ import javax.inject.Singleton
  *
  * Polling pauses when BLE connection is lost and resumes on reconnect (AC7).
  * Reduces frequency when phone battery is low (AC8).
+ *
+ * Failure model (GLY-249). The loops run under the service's `SupervisorJob`, so an escaping
+ * throw kills only its own loop — silently, and for the rest of the service's life. Three layers
+ * stop that:
+ * 1. Every step runs through [runStep]: a throw is reported against (loop, step) and the loop
+ *    moves on to the next step. One bad row, parse, or sync enqueue costs one reading, not history
+ *    backfill forever. The history step is the one place a failure costs the whole unit of work:
+ *    a backfill batch is all-or-nothing by design (GLY-250), so it is re-fetched next cycle
+ *    rather than half-committed.
+ * 2. Each loop body runs under [superviseLoop]: anything that escapes the step guards is reported,
+ *    backed off, and the loop is relaunched rather than left dead.
+ * 3. Every loop publishes a heartbeat to [PollLoopHealthTracker] — the timestamp of the last
+ *    iteration in which every step succeeded — which the debug console shows and the polling
+ *    watchdog (GLY-254) judges liveness by. A step that fails forever freezes the heartbeat
+ *    instead of faking health. The heartbeat also rides along in telemetry: every failure and
+ *    restart report carries [PollLoopHealth.telemetrySummary], and a loop that comes back after
+ *    failing reports the recovery, so both edges of an outage are visible remotely.
+ *
+ * `CancellationException` is never caught anywhere in this chain (it is rethrown first, following
+ * [processCgmReading]), so disconnect and `onDestroy` still tear the loops down immediately.
  */
 @Singleton
 class PumpPollingOrchestrator @Inject constructor(
     private val pumpDriver: PumpDriver,
     private val repository: PumpDataRepository,
     private val syncEnqueuer: SyncQueueEnqueuer,
-    private val rawHistoryLogDao: RawHistoryLogDao,
+    private val historyBackfill: HistoryBackfillWriter,
     private val wearDataSender: WearDataSender,
     private val glucoseRangeStore: GlucoseRangeStore,
     private val safetyLimitsStore: SafetyLimitsStore,
     private val historyLogParser: HistoryLogParser,
     private val appSettingsStore: AppSettingsStore,
     private val alertFloor: AlertFloor,
+    private val loopHealth: PollLoopHealthTracker,
 ) {
 
     /** Set by PumpConnectionService to trigger immediate sync after enqueue. */
     @Volatile
     var backendSyncManager: BackendSyncManager? = null
 
-    /** Track the last known raw event sequence number to fetch incrementally. */
+    /** The sequence number the next history fetch resumes from: the in-memory mirror of the
+     *  persisted backfill cursor. It moves only after a batch's derived records are committed,
+     *  never at the raw insert — see [readSequenceAnchor] and [HistoryBackfillWriter]. */
     @Volatile
     private var lastSequenceNumber: Int = 0
 
@@ -106,9 +130,12 @@ class PumpPollingOrchestrator @Inject constructor(
         stop() // cancel any previous jobs
         synchronized(lock) {
             connectionWatcherJob = scope.launch {
-                // Restore last known sequence number from Room to avoid re-downloading
-                lastSequenceNumber = rawHistoryLogDao.getMaxSequenceNumber() ?: 0
-
+                // No Room read here at all any more. The watcher used to restore the resume
+                // anchor before observing anything, which meant a Room/SQLCipher failure could
+                // kill it outright — no loops, no polling, no telemetry, for the life of the
+                // service (GLY-249 guarded that; GLY-250 removes the need for it). The anchor is
+                // now read at the top of every history poll instead, where a failure costs one
+                // backfill cycle and reports on the step guard.
                 pumpDriver.observeConnectionState().collectLatest { state ->
                     if (state == ConnectionState.CONNECTED) {
                         val isReconnection = hasBeenConnectedBefore
@@ -150,9 +177,15 @@ class PumpPollingOrchestrator @Inject constructor(
         synchronized(lock) {
             cancelPollingLoops()
 
-            fastJob = scope.launch { pollFastLoop() }
-            mediumJob = scope.launch { pollMediumLoop() }
-            slowJob = scope.launch { pollSlowLoop() }
+            fastJob = scope.launch {
+                superviseLoop(PollLoop.FAST, INITIAL_POLL_DELAY_MS, ::pollFastLoop)
+            }
+            mediumJob = scope.launch {
+                superviseLoop(PollLoop.MEDIUM, MEDIUM_LOOP_INITIAL_DELAY_MS, ::pollMediumLoop)
+            }
+            slowJob = scope.launch {
+                superviseLoop(PollLoop.SLOW, SLOW_LOOP_INITIAL_DELAY_MS, ::pollSlowLoop)
+            }
         }
     }
 
@@ -165,9 +198,15 @@ class PumpPollingOrchestrator @Inject constructor(
         synchronized(lock) {
             cancelPollingLoops()
 
-            fastJob = scope.launch { pollFastLoop(INITIAL_POLL_DELAY_MS) }
-            mediumJob = scope.launch { pollMediumLoop(RECONNECT_MEDIUM_DELAY_MS) }
-            slowJob = scope.launch { pollSlowLoop(RECONNECT_SLOW_DELAY_MS) }
+            fastJob = scope.launch {
+                superviseLoop(PollLoop.FAST, INITIAL_POLL_DELAY_MS, ::pollFastLoop)
+            }
+            mediumJob = scope.launch {
+                superviseLoop(PollLoop.MEDIUM, RECONNECT_MEDIUM_DELAY_MS, ::pollMediumLoop)
+            }
+            slowJob = scope.launch {
+                superviseLoop(PollLoop.SLOW, RECONNECT_SLOW_DELAY_MS, ::pollSlowLoop)
+            }
         }
     }
 
@@ -182,8 +221,218 @@ class PumpPollingOrchestrator @Inject constructor(
         }
     }
 
+    /**
+     * Resolve the history resume anchor — the highest sequence number whose DERIVED records are
+     * committed — so the backfill continues where it left off instead of re-reading the pump's
+     * whole history.
+     *
+     * Reads the persisted backfill cursor, not `MAX(sequenceNumber)` of the raw table (GLY-250).
+     * The raw table advances at the raw insert, ahead of the CGM/bolus/basal writes it feeds, so
+     * anchoring on it resumed above records that were never derived and lost them for good.
+     * A null cursor is a fresh install; anything else throws and stays distinguishable from one.
+     *
+     * Throws whatever Room throws, deliberately: the caller lets it reach [runStep], which
+     * reports it and retries next cycle. Degrading a transient database error to anchor 0 would
+     * re-download the pump's entire history behind the user's back (GLY-249).
+     */
+    private suspend fun readSequenceAnchor() {
+        lastSequenceNumber = historyBackfill.processedThroughSequence() ?: 0
+    }
+
     private fun effectiveInterval(baseMs: Long): Long =
         if (phoneBatteryLow) baseMs * LOW_BATTERY_MULTIPLIER else baseMs
+
+    /**
+     * Runs one loop body under a supervising restart (GLY-249). The per-step guards already absorb
+     * everything expected, so reaching the catch here means something threw where nothing should
+     * have — exactly the case that used to leave a loop permanently dead under the service's
+     * `SupervisorJob`. Report it, back off, relaunch.
+     *
+     * The relaunch passes an initial delay of 0: the loop's own initial delay exists to let BLE
+     * settle after connecting, which already happened; the backoff is the only wait that applies.
+     *
+     * Backoff escalates while restarts keep coming and resets as soon as the loop manages a clean
+     * iteration, so a persistently broken loop retries at [RESTART_BACKOFF_MAX_MS] instead of hot
+     * -looping, while a one-off blip costs [RESTART_BACKOFF_BASE_MS].
+     *
+     * `CancellationException` is rethrown untouched, so disconnect and `onDestroy` still stop the
+     * loop instead of restarting it.
+     */
+    private suspend fun superviseLoop(
+        loop: PollLoop,
+        initialDelayMs: Long,
+        body: suspend (Long) -> Unit,
+    ) {
+        val session = loopHealth.markRunning(loop)
+        var restartAttempt = 0
+        var nextInitialDelayMs = initialDelayMs
+        try {
+            while (true) {
+                val successesBefore = loopHealth.snapshot(loop).successCount
+                var failure: Exception? = null
+                try {
+                    // The bodies never return normally; if one ever does, the loop is just as dead
+                    // as if it had thrown, so it takes the same restart path (with a null cause).
+                    body(nextInitialDelayMs)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    failure = e
+                }
+                if (loopHealth.snapshot(loop).successCount > successesBefore) {
+                    restartAttempt = 0
+                }
+                val before = loopHealth.recordLoopRestart(loop, failure)
+                val backoffMs = restartBackoffMs(restartAttempt)
+                val cause = failure?.javaClass?.simpleName ?: "body returned normally"
+                val liveness = loopHealth.snapshot(loop).telemetrySummary()
+                // Loop, cause and liveness are separate format args: "which loop died", "what
+                // killed it" and "how long it has been without a clean iteration" are three
+                // different questions of the same telemetry event. Exception class only, per the
+                // ERROR/Sentry discipline in [runStep]; the throwable stays at DEBUG.
+                //
+                // A body that throws every time restarts forever on the backoff ceiling, so the
+                // report is damped the same way a repeating step failure is: opening edge and
+                // laddered reminders at ERROR, the rest on-device only.
+                if (before.opensFailureReport(PollLoopHealth.failureKind(null, failure))) {
+                    Timber.e(
+                        "Poll loop %s stopped outside a guarded step (%s); restarting in %d ms [%s]",
+                        loop.telemetryName,
+                        cause,
+                        backoffMs,
+                        liveness,
+                    )
+                    failure?.let { Timber.d(it, "Poll loop %s restart detail", loop.telemetryName) }
+                } else {
+                    Timber.d(
+                        failure,
+                        "Poll loop %s still failing outside a guarded step (%s); " +
+                            "restarting in %d ms [%s]",
+                        loop.telemetryName,
+                        cause,
+                        backoffMs,
+                        liveness,
+                    )
+                }
+                delay(backoffMs)
+                restartAttempt++
+                nextInitialDelayMs = 0L
+            }
+        } finally {
+            loopHealth.markStopped(loop, session)
+        }
+    }
+
+    private fun restartBackoffMs(attempt: Int): Long {
+        val shift = attempt.coerceIn(0, MAX_RESTART_BACKOFF_SHIFT)
+        return (RESTART_BACKOFF_BASE_MS shl shift).coerceAtMost(RESTART_BACKOFF_MAX_MS)
+    }
+
+    /**
+     * Runs one poll step behind its own guard and reports the outcome against (loop, step).
+     *
+     * Returns whether the step completed, so the caller can withhold the loop's heartbeat for an
+     * iteration that did not fully succeed. A failure is never rethrown: the next step in the same
+     * iteration still runs, because battery and reservoir have no business going dark over a
+     * history-log parse error.
+     *
+     * `CancellationException` is rethrown before the catch, following [processCgmReading] — a
+     * cancelled loop must die, not log and carry on.
+     */
+    private suspend fun runStep(step: PollStep, block: suspend () -> Unit): Boolean {
+        return try {
+            throwIfFaultArmed(step.telemetryName)
+            block()
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val before = loopHealth.recordStepFailure(step, e)
+            val liveness = loopHealth.snapshot(step.loop).telemetrySummary()
+            // Loop and step are separate format args so a log/Sentry search can isolate either
+            // axis: "which loop is broken" and "which step breaks it" are different questions.
+            // The liveness summary rides along so the event also answers "and for how long".
+            //
+            // ERROR is forwarded to Sentry as an event, so this line carries the exception CLASS
+            // only; the message and stacktrace stay on-device at DEBUG. Same discipline as
+            // MedtronicReadGateway: the guarded steps parse and persist readings, so an exception
+            // from a parser or a Room write can embed a health value in its message, and the
+            // beforeSend scrub only catches the unit-suffixed ones.
+            //
+            // Only a fault not yet seen in this outage, and the laddered reminders, go to ERROR:
+            // the loop keeps iterating through a failure by design, so an undamped report would
+            // ship one Sentry event per iteration for as long as the fault lasts. See
+            // [PollLoopHealth.opensFailureReport]. Nothing is lost on the device: the damped
+            // repeats are logged below with the throwable, and every report carries `since_ok=`.
+            if (before.opensFailureReport(PollLoopHealth.failureKind(step, e))) {
+                Timber.e(
+                    "Poll step failed (loop=%s step=%s cause=%s); continuing loop [%s]",
+                    step.loop.telemetryName,
+                    step.telemetryName,
+                    e.javaClass.simpleName,
+                    liveness,
+                )
+                Timber.d(
+                    e,
+                    "Poll step failure detail (loop=%s step=%s)",
+                    step.loop.telemetryName,
+                    step.telemetryName,
+                )
+            } else {
+                Timber.d(
+                    e,
+                    "Poll step still failing (loop=%s step=%s); continuing loop [%s]",
+                    step.loop.telemetryName,
+                    step.telemetryName,
+                    liveness,
+                )
+            }
+            false
+        }
+    }
+
+    /**
+     * Publishes the loop's heartbeat for an iteration in which every step succeeded, and reports
+     * the recovering edge when the loop had been failing.
+     *
+     * Only the recovery is logged: a healthy heartbeat every 15 seconds would be pure noise, while
+     * "the slow loop is polling again after 6 failures and 31 minutes dark" is the other half of
+     * the failure that opened the outage.
+     *
+     * WARN, not ERROR, and that is a real limit worth stating: WARN is Sentry's breadcrumb
+     * threshold, so this line rides along with a *later* event rather than raising one of its own.
+     * A recovery is not an error and must not bill an event, so remotely the "is it still dark"
+     * answer comes from `last_ok=` in the next report and, once GLY-254 lands, from the watchdog —
+     * not from this line.
+     */
+    private fun markIterationSucceeded(loop: PollLoop) {
+        val nowMs = System.currentTimeMillis()
+        val before = loopHealth.recordIterationSuccess(loop, nowMs)
+        if (before.failuresSinceLastSuccess == 0L) return
+        val darkSinceMs = before.lastSuccessAtMs ?: before.startedAtMs
+        Timber.w(
+            "Poll loop %s recovered after %d failure(s), %s without a clean iteration " +
+                "(last failing step=%s)",
+            loop.telemetryName,
+            before.failuresSinceLastSuccess,
+            darkSinceMs?.let { "${nowMs - it}ms" } ?: "unknown time",
+            before.lastFailureStep?.telemetryName ?: "none (loop body)",
+        )
+    }
+
+    /**
+     * Debug-build fault injection (GLY-249): throws when the armed key matches, so the recovery
+     * paths can be watched on a real device. Called from inside [runStep] for step keys and from
+     * the top of each loop body for [PollLoop.loopFaultKey] — the latter deliberately outside the
+     * step guard, so it exercises the supervising restart rather than the per-step catch.
+     *
+     * Release builds read an always-empty key from the store, so nothing can ever match.
+     */
+    private fun throwIfFaultArmed(key: String) {
+        if (appSettingsStore.debugFaultPollStep == key) {
+            throw IllegalStateException("Injected debug poll fault: $key")
+        }
+    }
 
     /**
      * Fast loop: IoB + basal rate + CGM at least every ~15s.
@@ -194,40 +443,47 @@ class PumpPollingOrchestrator @Inject constructor(
      * INTERVAL_FAST_MS + (FAST_REQUEST_COUNT - 1) * REQUEST_STAGGER_MS
      * plus any BLE response latency.
      */
-    private suspend fun pollFastLoop(initialDelayMs: Long = INITIAL_POLL_DELAY_MS) {
+    private suspend fun pollFastLoop(initialDelayMs: Long) {
         delay(initialDelayMs)
         while (true) {
-            pollIoB()
+            throwIfFaultArmed(PollLoop.FAST.loopFaultKey)
+            var complete = runStep(PollStep.IOB) { pollIoB() }
             delay(REQUEST_STAGGER_MS)
-            pollBasal()
+            complete = runStep(PollStep.BASAL) { pollBasal() } && complete
             delay(REQUEST_STAGGER_MS)
-            pollCgm()
+            complete = runStep(PollStep.CGM) { pollCgm() } && complete
+            if (complete) markIterationSucceeded(PollLoop.FAST)
             delay(effectiveInterval(INTERVAL_FAST_MS))
         }
     }
 
     /** Medium loop: last bolus status at least every ~5 min. */
-    private suspend fun pollMediumLoop(initialDelayMs: Long = MEDIUM_LOOP_INITIAL_DELAY_MS) {
+    private suspend fun pollMediumLoop(initialDelayMs: Long) {
         delay(initialDelayMs)
         while (true) {
-            pollBolusHistory()
+            throwIfFaultArmed(PollLoop.MEDIUM.loopFaultKey)
+            if (runStep(PollStep.BOLUS_HISTORY) { pollBolusHistory() }) {
+                markIterationSucceeded(PollLoop.MEDIUM)
+            }
             delay(effectiveInterval(INTERVAL_MEDIUM_MS))
         }
     }
 
     /** Slow loop: battery + reservoir + raw history logs + watch history at least every ~5 min. */
-    private suspend fun pollSlowLoop(initialDelayMs: Long = SLOW_LOOP_INITIAL_DELAY_MS) {
+    private suspend fun pollSlowLoop(initialDelayMs: Long) {
         delay(initialDelayMs)
         while (true) {
-            pollBattery()
+            throwIfFaultArmed(PollLoop.SLOW.loopFaultKey)
+            var complete = runStep(PollStep.BATTERY) { pollBattery() }
             delay(REQUEST_STAGGER_MS)
-            pollReservoir()
+            complete = runStep(PollStep.RESERVOIR) { pollReservoir() } && complete
             delay(REQUEST_STAGGER_MS)
-            pollHistoryLogs()
+            complete = runStep(PollStep.HISTORY_LOGS) { pollHistoryLogs() } && complete
             delay(REQUEST_STAGGER_MS)
-            cacheHardwareInfoOnce()
+            complete = runStep(PollStep.HARDWARE_INFO) { cacheHardwareInfoOnce() } && complete
             delay(REQUEST_STAGGER_MS)
-            sendWatchHistoryOverlays()
+            complete = runStep(PollStep.WATCH_HISTORY) { sendWatchHistoryOverlays() } && complete
+            if (complete) markIterationSucceeded(PollLoop.SLOW)
             delay(effectiveInterval(INTERVAL_SLOW_MS))
         }
     }
@@ -240,7 +496,11 @@ class PumpPollingOrchestrator @Inject constructor(
                 backendSyncManager?.triggerSync()
                 try {
                     wearDataSender.sendIoB(it.iob, it.timestamp.toEpochMilli())
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
+                    // Best-effort: an absent or unpaired watch must not fail the IoB step, which
+                    // has already persisted and enqueued the reading by this point.
                     Timber.w(e, "Failed to send IoB to watch")
                 }
             }
@@ -273,17 +533,16 @@ class PumpPollingOrchestrator @Inject constructor(
             .onFailure { Timber.w(it, "Failed to poll bolus history") }
     }
 
+    /** Guarded by [runStep] like every other step — the old blanket `catch (e: Exception)` here
+     *  also swallowed `CancellationException`, which kept the fast loop alive through a
+     *  disconnect for one more iteration. */
     private suspend fun pollCgm() {
-        try {
-            pumpDriver.getCgmStatus()
-                .onSuccess {
-                    repository.saveCgm(it)
-                    processCgmReading(it)
-                }
-                .onFailure { Timber.w(it, "Failed to poll CGM status") }
-        } catch (e: Exception) {
-            Timber.w(e, "CGM poll exception")
-        }
+        pumpDriver.getCgmStatus()
+            .onSuccess {
+                repository.saveCgm(it)
+                processCgmReading(it)
+            }
+            .onFailure { Timber.w(it, "Failed to poll CGM status") }
     }
 
     /**
@@ -454,6 +713,18 @@ class PumpPollingOrchestrator @Inject constructor(
         // When phone battery is low, slow everything down by this factor
         const val LOW_BATTERY_MULTIPLIER = 3
 
+        /** First wait before a supervisor relaunches a loop that threw outside a guarded step.
+         *  Short enough that a one-off blip costs a fraction of a poll interval. */
+        const val RESTART_BACKOFF_BASE_MS = 1_000L
+
+        /** Ceiling for the restart backoff: a loop that is broken for good retries at the slow
+         *  loop's own cadence rather than hot-looping on the pump's BLE link and the battery. */
+        const val RESTART_BACKOFF_MAX_MS = 300_000L
+
+        /** Doubling stops here so the shift can never overflow on a long-lived service; the
+         *  [RESTART_BACKOFF_MAX_MS] ceiling bites well before it anyway. */
+        const val MAX_RESTART_BACKOFF_SHIFT = 16
+
         /** How often the relay re-pushes an ONGOING (unchanged-type) alert while readings stay
          *  alertable — silent refreshes that keep the wrist copy's timestamp current, so
          *  axis (b) never greys a still-live alert as "data stale" (the CGM STALE band starts
@@ -532,8 +803,36 @@ class PumpPollingOrchestrator @Inject constructor(
      * On fresh installs (lastSequenceNumber == 0), performs a full initial sync
      * with extended duration (10 minutes) and requests the full pump history
      * from the BLE driver (no lookback limit, larger batch caps).
+     *
+     * Batch persistence is all-or-nothing and the resume cursor is the last thing to move
+     * (GLY-250) — see [HistoryBackfillWriter]. A batch that fails anywhere is simply re-fetched
+     * next cycle, so a record this build cannot parse or persist stalls the backfill at that
+     * batch rather than skipping past it. That is the deliberate trade: a stall freezes the slow
+     * loop's heartbeat and reports on the failure ladder, where skipping was silent and
+     * permanent. For that to hold, a stall has to be able to reach the ladder — so a driver that
+     * cannot make progress fails the fetch, and this step lets the failure out rather than
+     * logging it and returning as though the backfill were caught up.
+     *
+     * The durable cursor is the ONLY progress marker, and everything else is subordinate to it:
+     * it is re-read at the top of every cycle, and the driver's own scan position moves only
+     * when this loop acknowledges a batch. A driver that advanced its position at fetch time
+     * would skip a batch outright the moment a BLE flap cancelled the loop in between — see
+     * [PumpDriver.acknowledgeHistoryLogs].
      */
     private suspend fun pollHistoryLogs() {
+        // Re-read the durable cursor EVERY cycle, not just when the watcher's read failed. The
+        // in-memory mirror can lag it: `commitDerivedBatch` can commit and then still throw
+        // `CancellationException` on the way out (`withTransaction` resumes through
+        // `withContext`, which checks cancellation after the block has run), and the connection
+        // watcher cancels the poll loops on every non-CONNECTED emission — the BLE flap this
+        // epic exists for. A lagging mirror re-fetches an already-committed batch; re-reading
+        // one indexed single-row value per five-minute cycle removes the lag at the source.
+        //
+        // Deliberately unguarded: a broken DB throws into [runStep], which reports it as
+        // (slow, history_logs) and retries next cycle — far better than backfilling from a bogus
+        // anchor of 0, which would re-download the pump's entire history behind the user's back.
+        readSequenceAnchor()
+
         val limits = safetyLimitsStore.toSafetyLimits()
         if (safetyLimitsStore.isStale()) {
             Timber.w("Safety limits are stale (>%d ms old), using cached values", SafetyLimitsStore.STALE_THRESHOLD_MS)
@@ -559,13 +858,25 @@ class PumpPollingOrchestrator @Inject constructor(
                 pumpDriver.getHistoryLogs(sinceSequence = lastSequenceNumber)
             }
 
-            if (result.isFailure) {
-                Timber.w(result.exceptionOrNull(), "Failed to poll history logs (batch %d)", batchCount)
-                break
+            // Rethrown into [runStep], which reports it against the slow loop and retries next
+            // cycle. Swallowing it here made a driver that cannot make progress — one stuck
+            // re-requesting a window it cannot decode, say — look like a healthy, caught-up
+            // backfill for as long as it lasted.
+            //
+            // A driver does not get to decide what reaches the ladder, though. [PumpDriver] is a
+            // plugin SDK, and a blanket `catch (e: Exception)` around a BLE read catches this
+            // loop's own cancellation as readily as a decode failure — so a driver can hand back
+            // a routine disconnect as a pump outage. Our own job is the authority on that, and it
+            // is checked before the failure is believed.
+            val records = result.getOrElse { failure ->
+                currentCoroutineContext().ensureActive()
+                throw failure
             }
-            val records = result.getOrNull() ?: break
 
             if (records.isEmpty()) {
+                // Nothing to persist, so the driver's scan position over an empty answer is
+                // durably accounted for by definition.
+                pumpDriver.acknowledgeHistoryLogs()
                 if (batchCount > 0) {
                     if (isInitialSync) {
                         Timber.i("Initial pump history sync complete")
@@ -579,49 +890,91 @@ class PumpPollingOrchestrator @Inject constructor(
             batchCount++
             totalRecords += records.size
 
-            // Persist raw history log records
-            val entities = records.map { record ->
-                RawHistoryLogEntity(
-                    sequenceNumber = record.sequenceNumber,
-                    rawBytesB64 = record.rawBytesB64,
-                    eventTypeId = record.eventTypeId,
-                    pumpTimeSeconds = record.pumpTimeSeconds,
-                )
-            }
-            rawHistoryLogDao.insertAll(entities)
-            val newMaxSeq = records.maxOfOrNull { it.sequenceNumber } ?: lastSequenceNumber
-            if (newMaxSeq <= lastSequenceNumber) {
-                Timber.w("History sequence not advancing (batch %d, stuck at %d), breaking", batchCount, lastSequenceNumber)
+            val batchMaxSeq = records.maxOfOrNull { it.sequenceNumber } ?: lastSequenceNumber
+            if (batchMaxSeq <= lastSequenceNumber) {
+                // Every record in this batch is at or below the cursor, so all of them are
+                // already committed — the driver rescanning old indices, which is normal after a
+                // reconnect. Acknowledging lets its scan position move past them; without that
+                // it would re-serve the same window forever and the backfill would never reach
+                // the records that ARE new.
+                pumpDriver.acknowledgeHistoryLogs()
+                Timber.d("History batch %d is at or below the cursor (%d), advancing the scan past it", batchCount, lastSequenceNumber)
                 break
             }
-            lastSequenceNumber = newMaxSeq
-            Timber.d(
-                "Fetched batch %d: %d history records, %d total so far (seq up to %d)",
-                batchCount, records.size, totalRecords, lastSequenceNumber,
+
+            // How far this batch is entitled to move the cursor, checked against how much of it
+            // there is. The cursor lands on `batchMaxSeq` and every sequence it passes over is
+            // written off as done, so the batch has to contain a record for each of them: the
+            // gap-free contract on [PumpDriver.getHistoryLogs] is what makes that true, and this
+            // is where it is verified rather than assumed. Nothing below the batch's own first
+            // record counts — the driver is entitled to resume above the cursor when the pump
+            // holds nothing in between (a purged window, a shifted index range), and that leading
+            // gap is not the batch's to justify.
+            //
+            // What this catches is a batch that spans more sequences than it has records to
+            // account for: a hole in the middle of a driver's answer, or a garbage index sitting
+            // alongside the real records it came in with. Failing is the recoverable direction —
+            // the cursor stays put, the batch is re-fetched, and the failure reports on the slow
+            // loop's ladder — because a cursor that has run ahead cannot be walked back.
+            //
+            // What it cannot catch is a batch that is NOTHING BUT a garbage index: one record
+            // spans zero sequences, so the arithmetic is satisfied no matter how far above the
+            // cursor it sits, and there is no bound to apply here that a legitimate leading gap
+            // would not also trip. That case belongs to the drivers, which know the window they
+            // asked the pump for and refuse an answer from outside it — Tandem in
+            // `TandemBleDriver.fetchHistoryLogs`, Medtronic in `HistoryReader.readRecordsInRange`.
+            // This check is the cross-driver backstop for the shapes a window bound still lets
+            // through, not a substitute for one.
+            val batchMinSeq = records.minOf { it.sequenceNumber }
+            val advanceFrom = maxOf(lastSequenceNumber, batchMinSeq - 1)
+            val sequencesPassed = batchMaxSeq.toLong() - advanceFrom.toLong()
+            val recordsInBatch = records.distinctBy { it.sequenceNumber }.size
+            if (sequencesPassed > recordsInBatch) {
+                throw IllegalStateException(
+                    "History batch $batchCount would carry the cursor over $sequencesPassed " +
+                        "sequence(s) with only $recordsInBatch record(s) to account for them",
+                )
+            }
+
+            // Raw bytes first, marked unprocessed: they are the only copy of what the pump said,
+            // so they are kept whatever happens to the derivation below — and an unprocessed row
+            // is re-derivable locally, without asking the pump again.
+            historyBackfill.persistRawBatch(records)
+
+            // Parsing happens outside the transaction: it is pure CPU work with no business
+            // holding the write lock, and a record this build cannot parse must fail the batch
+            // before anything derived is committed.
+            val cgmReadings = historyLogParser.extractCgmFromHistoryLogs(records, limits)
+            val bolusEvents = historyLogParser.extractBolusesFromHistoryLogs(records, limits)
+            val basalReadings = historyLogParser.extractBasalFromHistoryLogs(records, limits)
+
+            // One transaction: derived rows + their sync-queue entries + the raw rows' processed
+            // flags + the resume cursor. All of it lands or none of it does, so a process death
+            // anywhere in this batch costs a re-fetch, never a record.
+            historyBackfill.commitDerivedBatch(
+                sequenceNumbers = records.map { it.sequenceNumber },
+                cgmReadings = cgmReadings,
+                bolusEvents = bolusEvents,
+                basalReadings = basalReadings,
+                throughInclusive = batchMaxSeq,
             )
 
-            // Extract and save CGM readings to fill chart gaps
-            val cgmReadings = historyLogParser.extractCgmFromHistoryLogs(records, limits)
-            if (cgmReadings.isNotEmpty()) {
-                repository.saveCgmBatch(cgmReadings)
-                totalCgm += cgmReadings.size
-            }
+            // Past the commit, and only now: tell the driver it may move whatever scan position
+            // it keeps. Anything that cancels the loop before this point leaves that position
+            // behind, so the batch is re-served rather than skipped — which is the whole reason
+            // the fetch does not advance it itself.
+            pumpDriver.acknowledgeHistoryLogs()
 
-            // Extract and save bolus events
-            val bolusEvents = historyLogParser.extractBolusesFromHistoryLogs(records, limits)
-            if (bolusEvents.isNotEmpty()) {
-                repository.saveBoluses(bolusEvents)
-                syncEnqueuer.enqueueBoluses(bolusEvents)
-                totalBolus += bolusEvents.size
-            }
-
-            // Extract and save basal delivery events
-            val basalReadings = historyLogParser.extractBasalFromHistoryLogs(records, limits)
-            if (basalReadings.isNotEmpty()) {
-                repository.saveBasalBatch(basalReadings)
-                syncEnqueuer.enqueueBasalBatch(basalReadings)
-                totalBasal += basalReadings.size
-            }
+            // Same for the in-memory cursor: it is the anchor the next fetch resumes from, and
+            // it must never run ahead of what is durable.
+            lastSequenceNumber = batchMaxSeq
+            totalCgm += cgmReadings.size
+            totalBolus += bolusEvents.size
+            totalBasal += basalReadings.size
+            Timber.d(
+                "Committed batch %d: %d history records, %d total so far (seq up to %d)",
+                batchCount, records.size, totalRecords, lastSequenceNumber,
+            )
 
             // Trigger backend sync after each batch so data is uploaded incrementally
             backendSyncManager?.triggerSync()
@@ -631,63 +984,59 @@ class PumpPollingOrchestrator @Inject constructor(
         }
     }
 
+    /** Guarded by [runStep] (which reports the failure against the slow loop and moves on), so
+     *  this no longer carries its own catch. */
     private suspend fun sendWatchHistoryOverlays() {
-        try {
-            val sixHoursAgo = Instant.now().minus(6, ChronoUnit.HOURS)
+        val sixHoursAgo = Instant.now().minus(6, ChronoUnit.HOURS)
 
-            // Cap records per type to stay well under the 100KB DataItem limit.
-            // 500 basal * 13B = 6.5KB, 500 bolus * 21B = 10.5KB, 500 IoB * 12B = 6KB
-            val basalReadings = repository.getBasalSince(sixHoursAgo).takeLast(MAX_HISTORY_RECORDS)
-            if (basalReadings.isNotEmpty()) {
-                val records = basalReadings.map { r ->
-                    WearHistorySerializer.BasalRecord(
-                        rate = r.rate,
-                        timestampMs = r.timestamp.toEpochMilli(),
-                        isAutomated = r.isAutomated,
-                        activityMode = activityModeToInt(r.activityMode),
-                    )
-                }
-                val data = WearHistorySerializer.encodeBasalHistory(records)
-                wearDataSender.sendBasalHistory(data, records.size)
+        // Cap records per type to stay well under the 100KB DataItem limit.
+        // 500 basal * 13B = 6.5KB, 500 bolus * 21B = 10.5KB, 500 IoB * 12B = 6KB
+        val basalReadings = repository.getBasalSince(sixHoursAgo).takeLast(MAX_HISTORY_RECORDS)
+        if (basalReadings.isNotEmpty()) {
+            val records = basalReadings.map { r ->
+                WearHistorySerializer.BasalRecord(
+                    rate = r.rate,
+                    timestampMs = r.timestamp.toEpochMilli(),
+                    isAutomated = r.isAutomated,
+                    activityMode = activityModeToInt(r.activityMode),
+                )
             }
-
-            val bolusEvents = repository.getBolusesSince(sixHoursAgo).takeLast(MAX_HISTORY_RECORDS)
-            if (bolusEvents.isNotEmpty()) {
-                val records = bolusEvents.map { e ->
-                    WearHistorySerializer.BolusRecord(
-                        units = e.units,
-                        correctionUnits = e.correctionUnits,
-                        mealUnits = e.mealUnits,
-                        timestampMs = e.timestamp.toEpochMilli(),
-                        isAutomated = e.isAutomated,
-                        isCorrection = e.isCorrection,
-                    )
-                }
-                val data = WearHistorySerializer.encodeBolusHistory(records)
-                wearDataSender.sendBolusHistory(data, records.size)
-            }
-
-            val iobReadings = repository.getIoBSince(sixHoursAgo).takeLast(MAX_HISTORY_RECORDS)
-            if (iobReadings.isNotEmpty()) {
-                val records = iobReadings.map { r ->
-                    WearHistorySerializer.IoBRecord(
-                        iob = r.iob,
-                        timestampMs = r.timestamp.toEpochMilli(),
-                    )
-                }
-                val data = WearHistorySerializer.encodeIoBHistory(records)
-                wearDataSender.sendIoBHistory(data, records.size)
-            }
-
-            Timber.d(
-                "Sent watch history overlays: %d basal, %d bolus, %d IoB",
-                basalReadings.size, bolusEvents.size, iobReadings.size,
-            )
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Timber.w(e, "Failed to send watch history overlays")
+            val data = WearHistorySerializer.encodeBasalHistory(records)
+            wearDataSender.sendBasalHistory(data, records.size)
         }
+
+        val bolusEvents = repository.getBolusesSince(sixHoursAgo).takeLast(MAX_HISTORY_RECORDS)
+        if (bolusEvents.isNotEmpty()) {
+            val records = bolusEvents.map { e ->
+                WearHistorySerializer.BolusRecord(
+                    units = e.units,
+                    correctionUnits = e.correctionUnits,
+                    mealUnits = e.mealUnits,
+                    timestampMs = e.timestamp.toEpochMilli(),
+                    isAutomated = e.isAutomated,
+                    isCorrection = e.isCorrection,
+                )
+            }
+            val data = WearHistorySerializer.encodeBolusHistory(records)
+            wearDataSender.sendBolusHistory(data, records.size)
+        }
+
+        val iobReadings = repository.getIoBSince(sixHoursAgo).takeLast(MAX_HISTORY_RECORDS)
+        if (iobReadings.isNotEmpty()) {
+            val records = iobReadings.map { r ->
+                WearHistorySerializer.IoBRecord(
+                    iob = r.iob,
+                    timestampMs = r.timestamp.toEpochMilli(),
+                )
+            }
+            val data = WearHistorySerializer.encodeIoBHistory(records)
+            wearDataSender.sendIoBHistory(data, records.size)
+        }
+
+        Timber.d(
+            "Sent watch history overlays: %d basal, %d bolus, %d IoB",
+            basalReadings.size, bolusEvents.size, iobReadings.size,
+        )
     }
 
     private suspend fun cacheHardwareInfoOnce() {

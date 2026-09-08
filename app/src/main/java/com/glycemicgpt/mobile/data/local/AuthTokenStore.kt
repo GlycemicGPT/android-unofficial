@@ -24,7 +24,7 @@ import javax.inject.Singleton
  * token operations (only by explicit user action).
  */
 @Singleton
-class AuthTokenStore @Inject constructor(
+open class AuthTokenStore @Inject constructor(
     @ApplicationContext context: Context,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
 ) {
@@ -81,8 +81,12 @@ class AuthTokenStore @Inject constructor(
      * gating, sync stand-down) observe this rather than re-deriving it from ad-hoc
      * [getBaseUrl] null-checks. A BLE-only user who left onboarding without a server reads
      * false here; a signed-in or server-configured user reads true.
+     *
+     * `open` so instrumented tests can answer it without writing a fake server address into the
+     * device's real credential store — an aborted run used to leave the installed app pointed at
+     * a test URL.
      */
-    fun isBackendConfigured(): Boolean = isBackendConfigured(getBaseUrl())
+    open fun isBackendConfigured(): Boolean = isBackendConfigured(getBaseUrl())
 
     /**
      * Emits the current base URL and re-emits whenever it changes, so surfaces that must track the

@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.IBinder
 import android.os.PowerManager
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.glycemicgpt.mobile.R
@@ -61,8 +62,42 @@ class PumpConnectionService : Service() {
         // Shorter wake lock for reconnection: covers max 32s backoff + GATT + JPAKE auth
         private const val RECONNECT_WAKE_LOCK_TIMEOUT_MS = 2L * 60 * 1000 // 2 minutes
 
-        fun start(context: Context) {
-            context.startForegroundService(Intent(context, PumpConnectionService::class.java))
+        /**
+         * Liveness probe the running instance publishes for [start], mirroring the `started` gate
+         * the in-service survive-branch in [onStartCommand] already uses (PR #44 review). A
+         * rejected *redundant* start -- Settings reopened, a re-login refresh, app `onCreate` --
+         * never reaches `onStartCommand`, so without this the companion would warn that pump
+         * monitoring is off while the BLE link is live and nothing would ever take the warning
+         * back. Holding the instance's state behind a lambda in a companion is a leak only if
+         * [onDestroy] never runs, and the reset there is the same reset the field itself gets;
+         * process death takes both.
+         */
+        @VisibleForTesting
+        @Volatile
+        internal var isRunning: () -> Boolean = { false }
+
+        fun start(context: Context): ForegroundServiceStartResult {
+            val result = ForegroundServiceStarter.start(
+                context,
+                Intent(context, PumpConnectionService::class.java),
+                FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                isRunning,
+            )
+            if (result is ForegroundServiceStartResult.Rejected && !result.componentStillRunning) {
+                // The service was never created, so nothing else will tell the user pump
+                // monitoring is off -- most likely on the boot path, with no app UI open to
+                // eventually notice via AlertFloorStatusProvider. GLY-254 owns the full
+                // monitoring-health surface and will supersede this notification.
+                // runCatching: this runs on the boot path, where BootCompletedReceiver has no
+                // catch of its own left -- a throw here must not escape this companion.
+                runCatching {
+                    MonitoringDegradedNotifier.notify(
+                        context.applicationContext ?: context,
+                        FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+                    )
+                }
+            }
+            return result
         }
 
         fun stop(context: Context) {
@@ -87,6 +122,9 @@ class PumpConnectionService : Service() {
 
     @Inject
     lateinit var authTokenStore: AuthTokenStore
+
+    @Inject
+    lateinit var fgsTimeoutReporter: FgsTimeoutReporter
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -113,8 +151,12 @@ class PumpConnectionService : Service() {
     private var wakeLockRenewalJob: Job? = null
     private var floorStatusWatcherJob: Job? = null
     private var wearStatusForwarderJob: Job? = null
+
+    /** Test seam: lets a rejected-redundant-repromote test set up an already-running service
+     *  without driving the full startup path. */
+    @VisibleForTesting
     @Volatile
-    private var started = false
+    internal var started = false
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -194,6 +236,7 @@ class PumpConnectionService : Service() {
         // emission is still in flight.
         lastFloorStatus = alertFloorStatusProvider.current()
         serviceScope.launch { backendConfigured = authTokenStore.isBackendConfigured() }
+        isRunning = { started }
         Timber.d("PumpConnectionService created")
     }
 
@@ -201,7 +244,51 @@ class PumpConnectionService : Service() {
         // Rebuild from the cached status, never the default: a redundant start during an outage
         // must not replace the honest "NOT watching" text with all-is-well copy.
         val notification = buildNotification(lastFloorStatus)
-        startForeground(NOTIFICATION_ID, notification)
+        val result = ForegroundServiceStarter.promote(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION,
+            fgsTimeoutReporter,
+        )
+        if (result is ForegroundServiceStartResult.Rejected) {
+            if (started) {
+                // A redundant re-promote (e.g. Settings reopened while already connected) was
+                // rejected -- the BLE link and polling are already live. Tearing this down would
+                // destroy a working connection over a rejection that only hit the *notification*
+                // re-promotion, not the work already underway (GLY-246 review F6). The service is
+                // demonstrably running under foreground protection already, so clear the marker
+                // this rejection just set -- otherwise GLY-254 would read a healthy component as
+                // still owing a resume (GLY-246 review F6 residual).
+                fgsTimeoutReporter.clearStartRejectedPending(FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                // Same reasoning for the notification an earlier rejection may have posted: pump
+                // monitoring is running, so the "monitoring not running" warning is now a lie
+                // (PR #44 review).
+                runCatching {
+                    MonitoringDegradedNotifier.clear(this, FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                }
+                Timber.w(
+                    "PumpConnectionService redundant re-promote rejected (%s); already running, continuing",
+                    result.exceptionType,
+                )
+            } else {
+                // The BLE link and polling only matter behind a live foreground promotion --
+                // without one the system can kill this process at any time. Stop cleanly instead
+                // of running unprotected; the rejection is already durably recorded for GLY-254
+                // to resume from.
+                Timber.w(
+                    "PumpConnectionService foreground start rejected (%s); stopping",
+                    result.exceptionType,
+                )
+                // GLY-254 owns the full monitoring-health surface and will supersede this
+                // notification.
+                runCatching {
+                    MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_PUMP_CONNECTION)
+                }
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+        }
 
         // Guard: only start orchestrators and watchers once per service lifecycle.
         // onStartCommand may be called multiple times (re-delivery, duplicate starts).
@@ -319,6 +406,7 @@ class PumpConnectionService : Service() {
             bluetoothReceiverRegistered = false
         }
         started = false
+        isRunning = { false }
         serviceScope.cancel()
         Timber.d("PumpConnectionService destroyed")
         super.onDestroy()

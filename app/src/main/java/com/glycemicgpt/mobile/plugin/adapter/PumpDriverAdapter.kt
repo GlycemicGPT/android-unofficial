@@ -98,6 +98,12 @@ class PumpDriverAdapter @Inject constructor(
         registry.activePumpPlugin.value?.asPumpStatus()?.getFullHistoryLogs(sinceSequence)
             ?: Result.failure(NoActivePluginException())
 
+    /** No active plugin means nothing handed us records to acknowledge, so there is nothing to
+     *  fail on -- unlike the read paths, whose callers need to see the absence. */
+    override suspend fun acknowledgeHistoryLogs() {
+        registry.activePumpPlugin.value?.asPumpStatus()?.acknowledgeHistoryLogs()
+    }
+
     override suspend fun getPumpHardwareInfo(): Result<PumpHardwareInfo> =
         registry.activePumpPlugin.value?.asPumpStatus()?.getPumpHardwareInfo()
             ?: Result.failure(NoActivePluginException())

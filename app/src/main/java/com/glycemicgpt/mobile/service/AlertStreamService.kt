@@ -6,7 +6,10 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
+import androidx.annotation.RequiresApi
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import com.glycemicgpt.mobile.BuildConfig
 import com.glycemicgpt.mobile.data.local.AppSettingsStore
@@ -48,8 +51,41 @@ class AlertStreamService : Service() {
         const val NOTIFICATION_ID = 2
         private const val MAX_BACKOFF_MS = 60_000L
         private const val STABLE_CONNECTION_MS = 10_000L // Must be open 10s before resetting backoff
-        fun start(context: Context) {
-            context.startForegroundService(Intent(context, AlertStreamService::class.java))
+        /**
+         * Liveness probe the running instance publishes for [start], evaluating the same
+         * `alreadyConnected` predicate the in-service survive-branch in [onStartCommand] uses
+         * (PR #44 review). A rejected *redundant* start -- Settings reopened, a re-login refresh --
+         * never reaches `onStartCommand`, so without this the companion would warn that alert
+         * delivery is off while the stream is live and nothing would ever take the warning back.
+         * Deliberately as strict as the in-service gate: a stream that is merely reconnecting is
+         * not evidence of coverage, so it still warns.
+         */
+        @VisibleForTesting
+        @Volatile
+        internal var isRunning: () -> Boolean = { false }
+
+        fun start(context: Context): ForegroundServiceStartResult {
+            val result = ForegroundServiceStarter.start(
+                context,
+                Intent(context, AlertStreamService::class.java),
+                FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+                isRunning,
+            )
+            if (result is ForegroundServiceStartResult.Rejected && !result.componentStillRunning) {
+                // The service was never created, so nothing else will tell the user alert
+                // delivery is off -- most likely on the boot path, with no app UI open to
+                // eventually notice. GLY-254 owns the full monitoring-health surface and will
+                // supersede this notification.
+                // runCatching: this runs on the boot path, where BootCompletedReceiver has no
+                // catch of its own left -- a throw here must not escape this companion.
+                runCatching {
+                    MonitoringDegradedNotifier.notify(
+                        context.applicationContext ?: context,
+                        FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+                    )
+                }
+            }
+            return result
         }
 
         fun stop(context: Context) {
@@ -64,6 +100,7 @@ class AlertStreamService : Service() {
     @Inject lateinit var alertStreamStateHolder: AlertStreamStateHolder
     @Inject lateinit var simulateUnreachableInterceptor: SimulateUnreachableInterceptor
     @Inject lateinit var appSettingsStore: AppSettingsStore
+    @Inject lateinit var fgsTimeoutReporter: FgsTimeoutReporter
     @Inject lateinit var moshi: Moshi
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -72,12 +109,24 @@ class AlertStreamService : Service() {
     // OkHttp-thread callbacks; without @Volatile a stale null read could leak a live connection
     // or open a duplicate one. Mutation is additionally confined to the @Synchronized
     // connectToStream/shutDownStream pair so only one connection transition runs at a time.
+    /** Test seam: lets a rejected-redundant-repromote test set up an already-connected stream
+     *  without driving a real SSE connection. */
+    @VisibleForTesting
     @Volatile
-    private var eventSource: EventSource? = null
+    internal var eventSource: EventSource? = null
 
     /** Set once in [shutDownStream]; blocks any late reconnect from resurrecting the stream. */
     @Volatile
     private var destroyed = false
+
+    /**
+     * Set by [onTimeout] so [onDestroy] knows it is running inside the system's few-second
+     * grace window and must not block. Read on the main thread, written on the main thread,
+     * but @Volatile for the same reason the fields around it are: OkHttp callbacks race the
+     * lifecycle.
+     */
+    @Volatile
+    private var stoppedByFgsTimeout = false
     private val reconnectAttempt = AtomicInteger(0)
     private val reconnectScheduled = AtomicBoolean(false)
     private var reconnectJob: Job? = null
@@ -86,8 +135,11 @@ class AlertStreamService : Service() {
     /** Generation counter to prevent stale callbacks from racing with new connections. */
     private val connectionGeneration = AtomicInteger(0)
 
-    // Reuse a single OkHttpClient across reconnects to avoid resource leaks
-    private val sseClient: OkHttpClient by lazy {
+    // Reuse a single OkHttpClient across reconnects to avoid resource leaks.
+    // Visible to the unit test so it can occupy the dispatcher and prove the timeout path really
+    // skips the drain in onDestroy -- an empty executor terminates instantly either way.
+    @VisibleForTesting
+    internal val sseClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             // The server heartbeats every 30s; 75s (2.5 intervals) tolerates one fully missed
@@ -121,18 +173,71 @@ class AlertStreamService : Service() {
                 }
             }
         }
+        isRunning = ::isStreamConnected
         Timber.d("AlertStreamService created")
     }
 
+    /**
+     * Coverage is the stream being open, not the service object existing: a service that is alive
+     * with a dead stream is exactly the state the alerting-degraded banner exists to report. Shared
+     * by [onStartCommand]'s survive-branch and the companion's [isRunning] probe so the two cannot
+     * disagree about what "running" means.
+     */
+    private fun isStreamConnected(): Boolean =
+        eventSource != null && alertStreamStateHolder.state.value == AlertStreamState.CONNECTED
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification())
+        val result = ForegroundServiceStarter.promote(
+            this,
+            NOTIFICATION_ID,
+            buildNotification(),
+            FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+            fgsTimeoutReporter,
+        )
         // A redundant start() (Settings opening, a re-login refresh) must not tear down a healthy
         // stream: the silent cancel-and-reconnect was invisible before the alerting-degraded
         // banner existed, but now it would flash "server alerts paused" for the seconds the
         // reconnect takes. A broken stream is never CONNECTED, so real recovery still proceeds.
-        if (eventSource == null ||
-            alertStreamStateHolder.state.value != AlertStreamState.CONNECTED
-        ) {
+        // Computed before the Rejected branch below so a rejected *redundant* re-promote can
+        // consult it too (GLY-246 review F6): a healthy running stream must survive one.
+        val alreadyConnected = isStreamConnected()
+
+        if (result is ForegroundServiceStartResult.Rejected) {
+            if (alreadyConnected) {
+                // The stream is demonstrably up already, so clear the marker this rejection just
+                // set -- otherwise GLY-254 would read a healthy component as still owing a resume
+                // (GLY-246 review F6 residual).
+                fgsTimeoutReporter.clearStartRejectedPending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                // Same reasoning for the notification an earlier rejection may have posted: alert
+                // delivery is up, so the "monitoring not running" warning is now a lie (PR #44
+                // review).
+                runCatching {
+                    MonitoringDegradedNotifier.clear(this, FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                }
+                Timber.w(
+                    "AlertStreamService redundant re-promote rejected (%s); stream already connected, continuing",
+                    result.exceptionType,
+                )
+            } else {
+                // Android 15 refuses a dataSync foreground start once the 24 h budget is spent
+                // (ForegroundServiceStartNotAllowedException, an IllegalStateException). Letting
+                // it escape kills the whole process -- taking PumpConnectionService and the pump
+                // link with it, which is the exact failure this service's onTimeout exists to
+                // prevent. Stop instead; the state holder already reports the honest degraded
+                // state, so the on-device alert floor arms rather than the user silently losing
+                // coverage.
+                alertStreamStateHolder.onStreamStopped()
+                // GLY-254 owns the full monitoring-health surface and will supersede this
+                // notification.
+                runCatching {
+                    MonitoringDegradedNotifier.notify(this, FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
+                }
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+        }
+
+        if (!alreadyConnected) {
             connectToStream()
             Timber.d("AlertStreamService started")
         } else {
@@ -143,16 +248,60 @@ class AlertStreamService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * The app's cumulative `dataSync` foreground-service budget (6 h per 24 h on Android 15,
+     * shared across every dataSync service the app declares) is spent. This service holds the
+     * SSE connection open for the whole login, so it is the one that normally burns it.
+     *
+     * The system gives a few seconds to stop here; miss the window and it throws
+     * `RemoteServiceException` and kills the process, taking PumpConnectionService and the pump
+     * connection down with it. So the stop goes first and nothing that can wait sits in front of
+     * it: [shutDownStream] takes the same instance monitor as [connectToStream], which a reconnect
+     * coroutine can be holding on the IO dispatcher while it reads keystore-backed prefs. That
+     * hold is milliseconds in practice, but it is a wait, and the grace window is the one thing
+     * here worth spending nothing on. Teardown after `stopSelf()` still runs to completion before
+     * [onDestroy] -- both are main-thread, so onDestroy cannot be delivered until this returns.
+     *
+     * The rest of the path stays cheap for the same reason: [shutDownStream] only cancels an
+     * EventSource and flips a StateFlow, the OkHttp dispatcher drain in [onDestroy] is skipped via
+     * [stoppedByFgsTimeout], and telemetry is prefs-`apply()` plus a log line.
+     *
+     * Losing the stream flips [AlertStreamStateHolder] to DISCONNECTED, which is what arms the
+     * on-device alert floor -- the user is told coverage degraded instead of silently losing it.
+     */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        stoppedByFgsTimeout = true
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        shutDownStream()
+        reconnectJob?.cancel()
+        fgsTimeoutReporter.recordTimeout(
+            component = FgsTimeoutReporter.COMPONENT_ALERT_STREAM,
+            startId = startId,
+            fgsType = fgsType,
+            // The stream is the durable work that has to come back once the budget allows it
+            // again; GLY-245 reads this marker to know a resume is owed.
+            resumable = true,
+        )
+    }
+
     override fun onDestroy() {
         shutDownStream()
         reconnectJob?.cancel()
         sseClient.dispatcher.executorService.shutdownNow()
-        try {
-            sseClient.dispatcher.executorService.awaitTermination(3, TimeUnit.SECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
+        // Draining the dispatcher blocks the main thread for up to 3s. That is fine on a normal
+        // stop, but on the onTimeout path it would spend the system's grace window before the
+        // service is actually destroyed. shutdownNow() has already interrupted the workers.
+        if (!stoppedByFgsTimeout) {
+            try {
+                sseClient.dispatcher.executorService.awaitTermination(3, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
         }
         sseClient.connectionPool.evictAll()
+        isRunning = { false }
         serviceScope.cancel()
         Timber.d("AlertStreamService destroyed")
         super.onDestroy()
@@ -231,6 +380,9 @@ class AlertStreamService : Service() {
                     if (connectionGeneration.get() != gen) return
                     Timber.d("Alert SSE stream connected (status=%d)", response.code)
                     alertStreamStateHolder.onStreamOpened()
+                    // The stream is live again, so whatever a previous FGS timeout cut short has
+                    // resumed. No-ops unless a marker is actually set.
+                    fgsTimeoutReporter.clearResumePending(FgsTimeoutReporter.COMPONENT_ALERT_STREAM)
                     connectionOpenedAtMs = System.currentTimeMillis()
                     // A fresh stream connection proves the backend is reachable again — drain
                     // any acks deferred while it wasn't. This covers phones whose only backend

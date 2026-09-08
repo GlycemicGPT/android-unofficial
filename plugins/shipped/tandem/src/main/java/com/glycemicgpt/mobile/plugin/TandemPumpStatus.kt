@@ -37,6 +37,9 @@ class TandemPumpStatus(
     override suspend fun getFullHistoryLogs(sinceSequence: Int): Result<List<HistoryLogRecord>> =
         bleDriver.getFullHistoryLogs(sinceSequence)
 
+    override suspend fun acknowledgeHistoryLogs() =
+        bleDriver.acknowledgeHistoryLogs()
+
     override fun extractCgmFromHistoryLogs(
         records: List<HistoryLogRecord>,
         limits: SafetyLimits,
