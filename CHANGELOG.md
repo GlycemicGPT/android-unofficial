@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.15.0](https://github.com/lumose-health/android-unofficial/compare/v0.14.0...v0.15.0) (2026-09-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **pump:** installing an older release after this one erases the app's local database -- on-phone pump history, recorded alerts, anything still queued to upload, and the raw pump records kept for re-derivation. Data already uploaded to your platform is unaffected. Upgrades are safe; there is no downgrade path that preserves local data. See docs/mobile/install.md.
+
+### Features
+
+* **pump:** make poll loops exception-proof and self-restarting ([#43](https://github.com/lumose-health/android-unofficial/issues/43)) ([1d046fe](https://github.com/lumose-health/android-unofficial/commit/1d046feaaeb36b8f334a75d3c5c40b2798555b12))
+
+
+### Bug Fixes
+
+* commit backfill batches atomically so process death cannot lose derived records ([#47](https://github.com/lumose-health/android-unofficial/issues/47)) ([4db65fc](https://github.com/lumose-health/android-unofficial/commit/4db65fc44e64ee85b1c17bb9fd2e02e4a0356ba5))
+* degrade instead of crashing when Android rejects a foreground-service start ([#44](https://github.com/lumose-health/android-unofficial/issues/44)) ([a77e031](https://github.com/lumose-health/android-unofficial/commit/a77e03155873ece6a99bd34f5f86628ae1c5a019))
+* **pump:** bound history answers to the window each driver asked for ([#49](https://github.com/lumose-health/android-unofficial/issues/49)) ([b150502](https://github.com/lumose-health/android-unofficial/commit/b1505023cfe61d7404b2e959e5511b210e76c851))
+* stop starting the pump service from Application.onCreate ([#46](https://github.com/lumose-health/android-unofficial/issues/46)) ([1e94fab](https://github.com/lumose-health/android-unofficial/commit/1e94fab54d5bdae7cdabca4cd39c5d073a7f1922))
+* survive the Android 15 dataSync foreground-service timeout without crashing ([#42](https://github.com/lumose-health/android-unofficial/issues/42)) ([2d9db26](https://github.com/lumose-health/android-unofficial/commit/2d9db2610d2a2b6181a72761f08de51a307fd7b6))
+
 ## [0.14.0](https://github.com/lumose-health/android-unofficial/compare/v0.13.0...v0.14.0) (2026-07-28)
 
 
